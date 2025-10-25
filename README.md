@@ -1,4 +1,11 @@
-# Cupertino NVR
+# 🎯 Cupertino NVR Multiplexer
+
+[![GitHub](https://img.shields.io/github/license/e7canasta/cupertino-nvr)](https://github.com/e7canasta/cupertino-nvr/blob/main/LICENSE)
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
+[![MQTT](https://img.shields.io/badge/MQTT-5.0-green.svg)](https://mqtt.org/)
+[![Architecture](https://img.shields.io/badge/architecture-4%2B1-orange.svg)](ARCHITECTURE_4+1.md)
+
+> **Distributed computer vision processing system with MQTT communication, real-time video walls, and stream processing capabilities**
 
 > **Distributed Network Video Recorder with AI Inference**
 
