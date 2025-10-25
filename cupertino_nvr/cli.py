@@ -33,7 +33,23 @@ def main():
     default=None,
     help="RTSP server URL (default: $STREAM_SERVER or rtsp://localhost:8554)",
 )
-def processor(n, start, end, streams, model, mqtt_host, mqtt_port, max_fps, stream_server):
+@click.option(
+    "--enable-control",
+    is_flag=True,
+    default=False,
+    help="Enable MQTT control plane for remote control (pause/resume/stop)",
+)
+@click.option(
+    "--control-topic",
+    default="nvr/control/commands",
+    help="MQTT topic for control commands (default: nvr/control/commands)",
+)
+@click.option(
+    "--status-topic",
+    default="nvr/control/status",
+    help="MQTT topic for status updates (default: nvr/control/status)",
+)
+def processor(n, start, end, streams, model, mqtt_host, mqtt_port, max_fps, stream_server, enable_control, control_topic, status_topic):
     """Run headless stream processor with MQTT event publishing"""
     from cupertino_nvr.processor import StreamProcessor, StreamProcessorConfig
 
@@ -61,10 +77,28 @@ def processor(n, start, end, streams, model, mqtt_host, mqtt_port, max_fps, stre
         mqtt_port=mqtt_port,
         max_fps=max_fps,
         source_id_mapping=stream_indices,  # Map internal indices to actual stream IDs
+        enable_control_plane=enable_control,
+        control_command_topic=control_topic,
+        control_status_topic=status_topic,
     )
 
     proc = StreamProcessor(config)
     proc.start()
+    
+    if enable_control:
+        click.echo("\n" + "="*70)
+        click.echo("🎬 StreamProcessor running with MQTT Control enabled")
+        click.echo("="*70)
+        click.echo(f"📡 Control Topic: {control_topic}")
+        click.echo(f"📊 Status Topic: {status_topic}")
+        click.echo("\n💡 Available MQTT commands:")
+        click.echo('   PAUSE:  {"command": "pause"}   - Pause stream processing')
+        click.echo('   RESUME: {"command": "resume"}  - Resume stream processing')
+        click.echo('   STOP:   {"command": "stop"}    - Stop processor completely')
+        click.echo('   STATUS: {"command": "status"}  - Query current status')
+        click.echo("\n⌨️  Press Ctrl+C to exit")
+        click.echo("="*70 + "\n")
+    
     proc.join()
 
 

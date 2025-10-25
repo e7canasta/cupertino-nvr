@@ -55,3 +55,13 @@ class StreamProcessorConfig:
     """Map internal source indices (0,1,2...) to actual stream IDs. 
     Used when specific streams are selected (e.g., [0,2,4] maps internal 0->0, 1->2, 2->4)"""
 
+    # Control Plane (MQTT control commands)
+    enable_control_plane: bool = False
+    """Enable MQTT control plane for remote control (pause/resume/stop)"""
+
+    control_command_topic: str = "nvr/control/commands"
+    """MQTT topic for receiving control commands"""
+
+    control_status_topic: str = "nvr/control/status"
+    """MQTT topic for publishing status updates"""
+
