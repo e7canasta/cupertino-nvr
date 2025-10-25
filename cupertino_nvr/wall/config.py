@@ -56,3 +56,8 @@ class VideoWallConfig:
     label_font_scale: float = 0.6
     """Font scale for detection labels"""
 
+    # Source ID mapping
+    source_id_mapping: Optional[List[int]] = None
+    """Map internal source indices (0,1,2...) to actual stream IDs. 
+    Used when specific streams are selected (e.g., [0,2,4] maps internal 0->0, 1->2, 2->4)"""
+

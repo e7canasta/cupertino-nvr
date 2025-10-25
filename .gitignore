@@ -65,3 +65,15 @@ dmypy.json
 # Build artifacts
 *.spec
 
+# Model weights and artifacts (keep out of version control)
+models/
+*.pt
+*.pth
+*.onnx
+*.weights
+*.bin
+*.safetensors
+*.h5
+*.pkl
+*.joblib
+

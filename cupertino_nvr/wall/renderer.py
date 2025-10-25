@@ -2,15 +2,16 @@
 Detection Renderer
 ==================
 
-Renders video frames with detection overlays.
+Renders video frames with detection overlays using supervision annotators.
 """
 
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 import cv2
 import numpy as np
+import supervision as sv
 
 from cupertino_nvr.events.schema import DetectionEvent
 from cupertino_nvr.wall.config import VideoWallConfig
@@ -22,7 +23,7 @@ class DetectionRenderer:
     """
     Renders video frames with detection overlays.
 
-    Uses OpenCV to draw bounding boxes, labels, and statistics
+    Uses supervision annotators to draw bounding boxes, labels, and statistics
     on video frames based on detection events.
 
     Args:
@@ -36,6 +37,19 @@ class DetectionRenderer:
 
     def __init__(self, config: VideoWallConfig):
         self.config = config
+
+        # Initialize supervision annotators
+        self.box_annotator = sv.BoxAnnotator(
+            thickness=config.box_thickness,
+            color=sv.Color.GREEN,
+        )
+
+        self.label_annotator = sv.LabelAnnotator(
+            text_scale=config.label_font_scale,
+            text_thickness=2,
+            text_color=sv.Color.BLACK,
+            color=sv.Color.GREEN,
+        )
 
     def render_frame(self, frame: object, event: Optional[DetectionEvent]) -> np.ndarray:
         """
@@ -67,52 +81,81 @@ class DetectionRenderer:
         return image
 
     def _draw_detections(self, image: np.ndarray, event: DetectionEvent) -> np.ndarray:
-        """Draw bounding boxes and labels for detections"""
+        """Draw bounding boxes and labels using supervision annotators"""
+        # Convert DetectionEvent to supervision.Detections
+        detections = self._to_supervision_detections(event)
+
+        # Annotate using supervision
+        image = self.box_annotator.annotate(scene=image.copy(), detections=detections)
+
+        # Create labels with class name, confidence, and tracker ID
+        labels = self._create_labels(event)
+        image = self.label_annotator.annotate(
+            scene=image, detections=detections, labels=labels
+        )
+
+        return image
+
+    def _to_supervision_detections(self, event: DetectionEvent) -> sv.Detections:
+        """
+        Convert DetectionEvent to supervision.Detections format.
+
+        Args:
+            event: DetectionEvent with bounding box detections
+
+        Returns:
+            supervision.Detections object
+        """
+        if not event.detections:
+            # Return empty detections
+            return sv.Detections.empty()
+
+        xyxy = []
+        confidence = []
+        class_id = []
+        tracker_id = []
+
         for det in event.detections:
-            # Convert center+size to xyxy
-            x1 = int(det.bbox.x - det.bbox.width / 2)
-            y1 = int(det.bbox.y - det.bbox.height / 2)
-            x2 = int(det.bbox.x + det.bbox.width / 2)
-            y2 = int(det.bbox.y + det.bbox.height / 2)
+            # Convert center+size to xyxy format
+            x1 = det.bbox.x - det.bbox.width / 2
+            y1 = det.bbox.y - det.bbox.height / 2
+            x2 = det.bbox.x + det.bbox.width / 2
+            y2 = det.bbox.y + det.bbox.height / 2
 
-            # Draw bounding box
-            cv2.rectangle(
-                image,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 0),  # Green
-                self.config.box_thickness,
-            )
+            xyxy.append([x1, y1, x2, y2])
+            confidence.append(det.confidence)
+            class_id.append(0)  # Default class ID (not used for visualization)
 
-            # Draw label
+            # Tracker ID (optional)
+            if det.tracker_id is not None:
+                tracker_id.append(det.tracker_id)
+            else:
+                tracker_id.append(-1)  # Sentinel for no tracker
+
+        return sv.Detections(
+            xyxy=np.array(xyxy),
+            confidence=np.array(confidence),
+            class_id=np.array(class_id),
+            tracker_id=np.array(tracker_id) if any(tid != -1 for tid in tracker_id) else None,
+        )
+
+    def _create_labels(self, event: DetectionEvent) -> List[str]:
+        """
+        Create label strings for each detection.
+
+        Args:
+            event: DetectionEvent with detections
+
+        Returns:
+            List of label strings
+        """
+        labels = []
+        for det in event.detections:
             label = f"{det.class_name} {det.confidence:.2f}"
             if det.tracker_id is not None:
                 label += f" #{det.tracker_id}"
-
-            # Label background
-            (label_width, label_height), _ = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, self.config.label_font_scale, 2
-            )
-            cv2.rectangle(
-                image,
-                (x1, y1 - label_height - 10),
-                (x1 + label_width, y1),
-                (0, 255, 0),
-                -1,  # Filled
-            )
-
-            # Label text
-            cv2.putText(
-                image,
-                label,
-                (x1, y1 - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                self.config.label_font_scale,
-                (0, 0, 0),  # Black text
-                2,
-            )
-
-        return image
+            labels.append(label)
+        return labels
 
     def _draw_statistics(
         self, image: np.ndarray, event: DetectionEvent, frame: object

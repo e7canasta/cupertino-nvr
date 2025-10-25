@@ -50,3 +50,8 @@ class StreamProcessorConfig:
     enable_watchdog: bool = True
     """Enable pipeline watchdog monitoring"""
 
+    # Source ID mapping
+    source_id_mapping: Optional[List[int]] = None
+    """Map internal source indices (0,1,2...) to actual stream IDs. 
+    Used when specific streams are selected (e.g., [0,2,4] maps internal 0->0, 1->2, 2->4)"""
+

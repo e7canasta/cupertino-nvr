@@ -55,10 +55,12 @@ class MQTTDetectionSink:
         mqtt_client: mqtt.Client,
         topic_prefix: str,
         model_id: str,
+        source_id_mapping: Optional[List[int]] = None,
     ):
         self.client = mqtt_client
         self.topic_prefix = topic_prefix
         self.model_id = model_id
+        self.source_id_mapping = source_id_mapping or []
 
     def __call__(
         self,
@@ -81,8 +83,11 @@ class MQTTDetectionSink:
                 continue
 
             try:
-                event = self._create_event(pred, frame)
-                topic = topic_for_source(frame.source_id, self.topic_prefix)
+                # Map internal source_id to actual stream ID
+                actual_source_id = self._get_actual_source_id(frame.source_id)
+                
+                event = self._create_event(pred, frame, actual_source_id)
+                topic = topic_for_source(actual_source_id, self.topic_prefix)
                 payload = event.model_dump_json()
 
                 result = self.client.publish(topic, payload, qos=0)
@@ -93,15 +98,31 @@ class MQTTDetectionSink:
                     )
 
             except Exception as e:
-                logger.error(f"Error in MQTT sink for source {frame.source_id}: {e}")
+                actual_source_id = self._get_actual_source_id(frame.source_id)
+                logger.error(f"Error in MQTT sink for source {actual_source_id}: {e}")
 
-    def _create_event(self, prediction: dict, frame: object) -> DetectionEvent:
+    def _get_actual_source_id(self, internal_source_id: int) -> int:
+        """
+        Map internal source_id (0,1,2...) to actual stream ID.
+        
+        Args:
+            internal_source_id: Internal source ID assigned by InferencePipeline
+            
+        Returns:
+            Actual stream ID that corresponds to the go2rtc stream number
+        """
+        if self.source_id_mapping and internal_source_id < len(self.source_id_mapping):
+            return self.source_id_mapping[internal_source_id]
+        return internal_source_id
+
+    def _create_event(self, prediction: dict, frame: object, actual_source_id: int) -> DetectionEvent:
         """
         Convert Roboflow prediction to DetectionEvent.
 
         Args:
             prediction: Roboflow prediction dictionary
             frame: VideoFrame object
+            actual_source_id: Actual stream ID to use in event
 
         Returns:
             DetectionEvent instance
@@ -124,7 +145,7 @@ class MQTTDetectionSink:
             )
 
         return DetectionEvent(
-            source_id=frame.source_id,
+            source_id=actual_source_id,
             frame_id=frame.frame_id,
             timestamp=frame.frame_timestamp,
             model_id=self.model_id,

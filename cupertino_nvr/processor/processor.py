@@ -7,6 +7,7 @@ Wraps InferencePipeline for multi-stream processing.
 """
 
 import logging
+import os
 import signal
 from typing import Optional
 
@@ -58,14 +59,19 @@ class StreamProcessor:
             f"Starting StreamProcessor with {len(self.config.stream_uris)} streams"
         )
 
+        # Enable frame dropping for better performance (new behavior from v0.26.0)
+        os.environ["ENABLE_FRAME_DROP_ON_VIDEO_FILE_RATE_LIMITING"] = "True"
+        logger.info("Frame dropping enabled for optimal performance")
+
         # Initialize MQTT client
         self.mqtt_client = self._init_mqtt_client()
 
-        # Create MQTT sink
+        # Create MQTT sink with source ID mapping
         mqtt_sink = MQTTDetectionSink(
             mqtt_client=self.mqtt_client,
             topic_prefix=self.config.mqtt_topic_prefix,
             model_id=self.config.model_id,
+            source_id_mapping=self.config.source_id_mapping,
         )
 
         # Import InferencePipeline here to avoid hard dependency at module level

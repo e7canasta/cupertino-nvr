@@ -77,10 +77,12 @@ class VideoWall:
                 "Install with: pip install inference"
             ) from e
 
-        # Initialize video sources
+        # Initialize video sources with proper source_id mapping
+        # Use source_id_mapping if provided, otherwise use sequential indices
+        source_ids = self.config.source_id_mapping or list(range(len(self.config.stream_uris)))
         cameras = [
-            VideoSource.init(uri, source_id=i)
-            for i, uri in enumerate(self.config.stream_uris)
+            VideoSource.init(uri, source_id=source_id)
+            for uri, source_id in zip(self.config.stream_uris, source_ids)
         ]
 
         for camera in cameras:
