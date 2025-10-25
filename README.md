@@ -17,6 +17,50 @@ A production-ready NVR system that separates inference processing from visualiza
 
 ---
 
+## 📐 Architecture
+
+This system implements the **4+1 architectural views** methodology. See [ARCHITECTURE_4+1.md](ARCHITECTURE_4+1.md) for comprehensive architectural analysis.
+
+### High-Level Components
+
+```mermaid
+graph TB
+    subgraph "Stream Processing"
+        SP[StreamProcessor]
+        IP[InferencePipeline] 
+        MS[MQTTSink]
+    end
+    
+    subgraph "MQTT Communication"
+        MB[MQTT Broker]
+    end
+    
+    subgraph "Video Wall"
+        VW[VideoWall]
+        ML[MQTTListener]
+        DC[DetectionCache]
+        R[Renderer]
+    end
+    
+    SP --> IP
+    IP --> MS
+    MS --> MB
+    MB --> ML
+    ML --> DC
+    DC --> R
+    VW --> R
+```
+
+### Key Features
+
+- 🔄 **Distributed Processing**: MQTT-based communication between components
+- 📺 **Real-time Video Walls**: Live video display with detection overlays
+- ⚡ **High Performance**: Configurable worker processes and GPU acceleration
+- 🛠️ **Production Ready**: Comprehensive logging, monitoring, and error handling
+- 🔧 **Highly Configurable**: TOML-based configuration with validation
+
+---
+
 ## 🚀 Quick Start (2 minutes)
 
 ```bash
