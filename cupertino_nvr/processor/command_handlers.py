@@ -14,6 +14,7 @@ from typing import Protocol, Optional, Any, Callable
 
 from cupertino_nvr.logging_utils import get_component_logger
 from cupertino_nvr.processor.config import ConfigValidationError
+from cupertino_nvr.processor.validators import CommandValidators, CommandValidationError
 
 logger = get_component_logger(__name__, "command_handlers")
 
@@ -242,7 +243,7 @@ class CommandHandlers:
         return self._execute_config_change(
             param_name="model_id",
             param_value=params.get("model_id"),
-            validator=self._validate_model_id,
+            validator=CommandValidators.validate_model_id,
             config_attr="model_id",
             command_name="CHANGE_MODEL"
         )
@@ -257,7 +258,7 @@ class CommandHandlers:
         return self._execute_config_change(
             param_name="max_fps",
             param_value=params.get("max_fps"),
-            validator=self._validate_fps,
+            validator=CommandValidators.validate_fps,
             config_attr="max_fps",
             command_name="SET_FPS"
         )
@@ -276,11 +277,8 @@ class CommandHandlers:
         if source_id is None:
             raise ValueError("Missing required parameter: source_id")
 
-        # Validate source_id type
-        try:
-            source_id = int(source_id)
-        except (ValueError, TypeError) as e:
-            raise ValueError(f"Invalid source_id value: {source_id}") from e
+        # Validate source_id (replaces inline try/except)
+        source_id = CommandValidators.validate_source_id(source_id)
 
         # Execute using template method
         return self._execute_stream_change(
@@ -301,11 +299,8 @@ class CommandHandlers:
         if source_id is None:
             raise ValueError("Missing required parameter: source_id")
 
-        # Validate source_id type
-        try:
-            source_id = int(source_id)
-        except (ValueError, TypeError) as e:
-            raise ValueError(f"Invalid source_id value: {source_id}") from e
+        # Validate source_id (replaces inline try/except)
+        source_id = CommandValidators.validate_source_id(source_id)
 
         # Execute using template method
         return self._execute_stream_change(
@@ -651,24 +646,4 @@ class CommandHandlers:
 
             raise
 
-    # ========================================================================
-    # Private: Validators
-    # ========================================================================
 
-    @staticmethod
-    def _validate_model_id(model_id: str) -> str:
-        """Validate model_id parameter."""
-        if not isinstance(model_id, str) or not model_id.strip():
-            raise ValueError(f"Invalid model_id: {model_id}")
-        return model_id.strip()
-
-    @staticmethod
-    def _validate_fps(fps: Any) -> float:
-        """Validate max_fps parameter."""
-        try:
-            fps_float = float(fps)
-            if fps_float <= 0:
-                raise ValueError("max_fps must be > 0")
-            return fps_float
-        except (ValueError, TypeError) as e:
-            raise ValueError(f"Invalid max_fps value: {fps}") from e
