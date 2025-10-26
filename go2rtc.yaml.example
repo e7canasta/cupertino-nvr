@@ -1,0 +1,152 @@
+# go2rtc Configuration Example
+# Residencia Geriátrica - 13 Habitaciones (0-12)
+#
+# Installation:
+#   docker run -d --name go2rtc \
+#     -p 8554:8554 -p 1984:1984 \
+#     -v $(pwd)/go2rtc.yaml:/config/go2rtc.yaml \
+#     alexxit/go2rtc
+#
+# Usage in services:
+#   cupertino-nvr processor --streams 0,1,2 --stream-server rtsp://localhost:8554
+#   → Generates: rtsp://localhost:8554/0, rtsp://localhost:8554/1, rtsp://localhost:8554/2
+#   → go2rtc routes to real camera URLs below
+#
+# MQTT add_stream command:
+#   mosquitto_pub -h localhost -t "nvr/control/commands" \
+#     -m '{"command": "add_stream", "params": {"source_id": 8}}'
+#   → Generates: rtsp://localhost:8554/8
+#   → Must exist in streams config below!
+
+# API for management
+api:
+  listen: ":1984"
+
+# RTSP server (proxy/router)
+rtsp:
+  listen: ":8554"
+
+# WebRTC for browser viewing (optional)
+webrtc:
+  listen: ":8555"
+
+# Stream mappings (0-12 = room numbers)
+streams:
+  # ========================================
+  # Habitación 0 - Residente: Juan Pérez
+  # ========================================
+  "0":
+    - rtsp://admin:password123@192.168.1.100:554/stream1
+    # Optional: Hardware transcode if camera format not compatible
+    # - "ffmpeg:0#video=h264#hardware"
+
+  # ========================================
+  # Habitación 1 - Residente: María García
+  # ========================================
+  "1":
+    - rtsp://admin:password123@camara-hab-2.local:8554/h264/ch01/main/av_stream
+
+  # ========================================
+  # Habitación 2 - Residente: Pedro López
+  # ========================================
+  "2":
+    - rtsp://10.0.1.50/live/ch00_0
+
+  # ========================================
+  # Habitación 3 - Residente: Ana Martínez
+  # ========================================
+  "3":
+    - rtsp://admin:password123@192.168.1.103:554/live.sdp
+
+  # ========================================
+  # Habitación 4 - Residente: Luis Rodríguez
+  # ========================================
+  "4":
+    - rtsp://admin:password123@192.168.1.104:554/stream1
+
+  # ========================================
+  # Habitación 5 - Residente: Carmen Sánchez
+  # ========================================
+  "5":
+    - rtsp://admin:password123@camara-hab-6.local:554/stream
+
+  # ========================================
+  # Habitación 6 - Residente: José Fernández
+  # ========================================
+  "6":
+    - rtsp://admin:password123@192.168.1.106:554/h264
+
+  # ========================================
+  # Habitación 7 - Residente: Isabel Ruiz
+  # ========================================
+  "7":
+    - rtsp://10.0.1.57/live/main
+
+  # ========================================
+  # Habitación 8 - Residente: Francisco Díaz
+  # ========================================
+  "8":
+    - rtsp://admin:password123@camara-hab-9.local:8554/stream1
+
+  # ========================================
+  # Habitación 9 - Residente: Teresa Moreno
+  # ========================================
+  "9":
+    - rtsp://admin:password123@192.168.1.109:554/live
+
+  # ========================================
+  # Habitación 10 - Residente: Antonio Muñoz
+  # ========================================
+  "10":
+    - rtsp://10.0.1.60/h264/ch01/main/av_stream
+
+  # ========================================
+  # Habitación 11 - Residente: Dolores Álvarez
+  # ========================================
+  "11":
+    - rtsp://admin:password123@camara-hab-12.local:554/stream
+
+  # ========================================
+  # Habitación 12 - Residente: Rosa Jiménez
+  # ========================================
+  "12":
+    - rtsp://admin:password123@192.168.1.112:554/live.sdp
+
+# ========================================
+# Testing Configuration
+# ========================================
+# For testing/development, you can use MediaMTX instead of real cameras:
+#
+# streams:
+#   "0": rtsp://mediamtx:8554/live/0.stream
+#   "1": rtsp://mediamtx:8554/live/1.stream
+#   "2": rtsp://mediamtx:8554/live/2.stream
+#   ...
+
+# ========================================
+# Advanced Options
+# ========================================
+
+# Logging
+log:
+  level: info
+  # Options: debug, info, warn, error
+
+# Record streams (optional)
+# record:
+#   enabled: true
+#   path: /recordings/{stream}/{time}.mp4
+
+# ========================================
+# Troubleshooting
+# ========================================
+#
+# Test stream:
+#   ffplay rtsp://localhost:8554/0
+#
+# Check API:
+#   curl http://localhost:1984/api/streams
+#   curl http://localhost:1984/api/streams/0
+#
+# View in browser (WebRTC):
+#   http://localhost:1984/

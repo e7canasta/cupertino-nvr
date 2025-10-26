@@ -5,8 +5,9 @@ StreamProcessor Configuration
 Configuration dataclass for headless stream processor.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
+import uuid
 
 
 @dataclass
@@ -52,8 +53,12 @@ class StreamProcessorConfig:
 
     # Source ID mapping
     source_id_mapping: Optional[List[int]] = None
-    """Map internal source indices (0,1,2...) to actual stream IDs. 
+    """Map internal source indices (0,1,2...) to actual stream IDs.
     Used when specific streams are selected (e.g., [0,2,4] maps internal 0->0, 1->2, 2->4)"""
+
+    # Stream server base URL (for add_stream command)
+    stream_server: str = "rtsp://localhost:8554"
+    """Base RTSP server URL (go2rtc proxy). Used to construct stream URIs: {stream_server}/{source_id}"""
 
     # Control Plane (MQTT control commands)
     enable_control_plane: bool = False
@@ -64,4 +69,15 @@ class StreamProcessorConfig:
 
     control_status_topic: str = "nvr/control/status"
     """MQTT topic for publishing status updates"""
+
+    # Metrics Reporting (Observability)
+    metrics_reporting_interval: int = 10
+    """Interval in seconds for auto-reporting metrics (0 = disabled)"""
+
+    metrics_topic: str = "nvr/status/metrics"
+    """MQTT topic for periodic metrics reporting (observability channel)"""
+
+    # Instance Identification (Multi-Instance Support)
+    instance_id: str = field(default_factory=lambda: f"processor-{uuid.uuid4().hex[:8]}")
+    """Unique instance identifier (default: auto-generated processor-{random})"""
 

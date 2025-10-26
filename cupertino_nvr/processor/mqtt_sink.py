@@ -7,6 +7,7 @@ Compatible with InferencePipeline on_prediction signature.
 """
 
 import logging
+import threading
 from typing import List, Optional, Union
 
 import paho.mqtt.client as mqtt
@@ -28,24 +29,32 @@ class MQTTDetectionSink:
     Args:
         mqtt_client: Connected paho.mqtt.Client instance
         topic_prefix: MQTT topic prefix (default: "nvr/detections")
-        model_id: Model ID for event metadata
+        config: Reference to StreamProcessorConfig for dynamic model_id lookup
+        source_id_mapping: Optional mapping from internal source_id to actual stream ID
+
+    Note:
+        The sink stores a reference to config (not a copy) so it can access
+        the current model_id dynamically. This allows model changes via
+        MQTT control commands without recreating the sink.
 
     Example:
         >>> import paho.mqtt.client as mqtt
         >>> from inference import InferencePipeline
+        >>> from cupertino_nvr.processor import StreamProcessorConfig
         >>>
         >>> # Setup MQTT
         >>> client = mqtt.Client()
         >>> client.connect("localhost", 1883)
         >>> client.loop_start()
         >>>
-        >>> # Create sink
-        >>> sink = MQTTDetectionSink(client, "nvr/detections", "yolov8x-640")
+        >>> # Create config and sink
+        >>> config = StreamProcessorConfig(...)
+        >>> sink = MQTTDetectionSink(client, "nvr/detections", config)
         >>>
         >>> # Use with pipeline
         >>> pipeline = InferencePipeline.init(
         ...     video_reference=["rtsp://..."],
-        ...     model_id="yolov8x-640",
+        ...     model_id=config.model_id,
         ...     on_prediction=sink,
         ... )
     """
@@ -54,13 +63,18 @@ class MQTTDetectionSink:
         self,
         mqtt_client: mqtt.Client,
         topic_prefix: str,
-        model_id: str,
+        config: object,  # StreamProcessorConfig
         source_id_mapping: Optional[List[int]] = None,
     ):
         self.client = mqtt_client
         self.topic_prefix = topic_prefix
-        self.model_id = model_id
+        self.config = config  # Store reference to config for dynamic model_id lookup
         self.source_id_mapping = source_id_mapping or []
+
+        # Thread-safe pause control using Event (guarantees memory visibility across threads)
+        # See PAUSE_BUG_HYPOTHESIS.md for explanation of why Event > boolean flag
+        self._running = threading.Event()
+        self._running.set()  # Start in running state
 
     def __call__(
         self,
@@ -74,6 +88,10 @@ class MQTTDetectionSink:
             predictions: Single prediction dict or list of prediction dicts
             video_frame: Single VideoFrame or list of VideoFrames
         """
+        # Skip publishing if paused (thread-safe check with memory barrier)
+        if not self._running.is_set():
+            return
+        
         # Wrap in list if single prediction
         predictions = self._wrap_in_list(predictions)
         video_frames = self._wrap_in_list(video_frame)
@@ -145,14 +163,31 @@ class MQTTDetectionSink:
             )
 
         return DetectionEvent(
+            instance_id=self.config.instance_id,  # Multi-instance support
             source_id=actual_source_id,
             frame_id=frame.frame_id,
             timestamp=frame.frame_timestamp,
-            model_id=self.model_id,
+            model_id=self.config.model_id,  # Dynamic lookup from config
             inference_time_ms=prediction.get("time", 0) * 1000,
             detections=detections,
             fps=None,  # Can be computed if needed
             latency_ms=None,
+        )
+
+    def pause(self):
+        """Pause publishing (immediate effect, thread-safe)"""
+        self._running.clear()  # Thread-safe pause with memory barrier
+        logger.info(
+            "MQTT sink paused - no events will be published",
+            extra={"component": "mqtt_sink", "event": "sink_paused"}
+        )
+
+    def resume(self):
+        """Resume publishing (thread-safe)"""
+        self._running.set()  # Thread-safe resume with memory barrier
+        logger.info(
+            "MQTT sink resumed - publishing events",
+            extra={"component": "mqtt_sink", "event": "sink_resumed"}
         )
 
     @staticmethod

@@ -33,7 +33,8 @@ class DetectionEvent(BaseModel):
     """Detection event published to MQTT"""
 
     # Metadata
-    source_id: int = Field(description="Stream source ID (0-indexed)")
+    instance_id: str = Field(description="Processor instance identifier")
+    source_id: int = Field(description="Stream/camera source ID (0-indexed)")
     frame_id: int = Field(description="Frame sequence number")
     timestamp: datetime = Field(description="Frame capture timestamp")
 
@@ -49,6 +50,7 @@ class DetectionEvent(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
+                "instance_id": "processor-a3f2b1c0",
                 "source_id": 0,
                 "frame_id": 12345,
                 "timestamp": "2025-10-25T10:30:00.123Z",

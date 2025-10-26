@@ -33,6 +33,7 @@ dependencies = [
     "opencv-python>=4.8.0", # Video processing
     "supervision>=0.16.0", # Detection annotations
     "inference>=0.59.0",
+    "python-json-logger>=2.0.0", # Structured JSON logging
 ]
 
 [project.optional-dependencies]
