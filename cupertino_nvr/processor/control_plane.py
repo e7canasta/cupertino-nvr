@@ -15,6 +15,8 @@ from typing import Optional, Callable, Dict
 
 import paho.mqtt.client as mqtt
 
+from cupertino_nvr.interfaces import MessageBroker
+
 logger = logging.getLogger(__name__)
 
 
@@ -103,11 +105,13 @@ class MQTTControlPlane:
         broker_port: MQTT broker port
         command_topic: Topic para recibir comandos
         status_topic: Topic para publicar estado
+        instance_id: Instance ID for multi-instance support
         client_id: MQTT client ID
         username: MQTT username (opcional)
         password: MQTT password (opcional)
+        mqtt_client: Optional MQTT client (for dependency injection/testing)
     """
-    
+
     def __init__(
         self,
         broker_host: str,
@@ -118,6 +122,7 @@ class MQTTControlPlane:
         client_id: str = "nvr_control",
         username: Optional[str] = None,
         password: Optional[str] = None,
+        mqtt_client: Optional[MessageBroker] = None,
     ):
         self.broker_host = broker_host
         self.broker_port = broker_port
@@ -125,19 +130,31 @@ class MQTTControlPlane:
         self.status_topic_prefix = status_topic  # Store as prefix for instance-specific topics
         self.instance_id = instance_id
         self.client_id = client_id
-        
+
         # Command registry
         self.command_registry = CommandRegistry()
-        
-        # MQTT Client
-        self.client = mqtt.Client(client_id=client_id)
-        if username and password:
-            self.client.username_pw_set(username, password)
-        
-        self.client.on_connect = self._on_connect
-        self.client.on_message = self._on_message
-        self.client.on_disconnect = self._on_disconnect
-        
+
+        # MQTT Client (use injected client or create new one)
+        if mqtt_client is not None:
+            self.client = mqtt_client
+            # For injected clients, assume callbacks should be set externally
+            # or they're already configured (e.g., FakeBroker)
+            if hasattr(self.client, 'on_connect'):
+                self.client.on_connect = self._on_connect
+            if hasattr(self.client, 'on_message'):
+                self.client.on_message = self._on_message
+            if hasattr(self.client, 'on_disconnect'):
+                self.client.on_disconnect = self._on_disconnect
+        else:
+            # Default: create paho.mqtt.Client
+            self.client = mqtt.Client(client_id=client_id)
+            if username and password:
+                self.client.username_pw_set(username, password)
+
+            self.client.on_connect = self._on_connect
+            self.client.on_message = self._on_message
+            self.client.on_disconnect = self._on_disconnect
+
         self._connected = Event()
     
     def _on_connect(self, client, userdata, flags, rc):

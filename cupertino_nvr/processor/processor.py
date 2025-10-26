@@ -28,6 +28,7 @@ from cupertino_nvr.processor.pipeline_manager import InferencePipelineManager
 from cupertino_nvr.processor.command_handlers import CommandHandlers
 from cupertino_nvr.processor.metrics_reporter import MetricsReporter
 from cupertino_nvr.logging_utils import get_component_logger
+from cupertino_nvr.interfaces import MessageBroker
 
 logger = get_component_logger(__name__, "processor")
 
@@ -65,7 +66,7 @@ class StreamProcessor:
         self.config = config
 
         # Components (created in start())
-        self.mqtt_client: Optional[mqtt.Client] = None
+        self.mqtt_client: Optional[MessageBroker] = None
         self.mqtt_sink: Optional[MQTTDetectionSink] = None
         self.pipeline_manager: Optional[InferencePipelineManager] = None
         self.control_plane: Optional[MQTTControlPlane] = None

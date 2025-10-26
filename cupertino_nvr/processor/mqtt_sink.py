@@ -14,6 +14,7 @@ import paho.mqtt.client as mqtt
 
 from cupertino_nvr.events.protocol import topic_for_source
 from cupertino_nvr.events.schema import BoundingBox, Detection, DetectionEvent
+from cupertino_nvr.interfaces import MessageBroker
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class MQTTDetectionSink:
     publishes them to MQTT topics organized by source_id.
 
     Args:
-        mqtt_client: Connected paho.mqtt.Client instance
+        mqtt_client: Connected MQTT client (MessageBroker protocol)
         topic_prefix: MQTT topic prefix (default: "nvr/detections")
         config: Reference to StreamProcessorConfig for dynamic model_id lookup
         source_id_mapping: Optional mapping from internal source_id to actual stream ID
@@ -61,7 +62,7 @@ class MQTTDetectionSink:
 
     def __init__(
         self,
-        mqtt_client: mqtt.Client,
+        mqtt_client: MessageBroker,
         topic_prefix: str,
         config: object,  # StreamProcessorConfig
         source_id_mapping: Optional[List[int]] = None,
