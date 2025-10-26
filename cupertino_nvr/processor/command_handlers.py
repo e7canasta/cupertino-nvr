@@ -277,86 +277,23 @@ class CommandHandlers:
 
         Stream URI is constructed automatically from stream_server config.
         """
+        # Validate parameter presence
         source_id = params.get("source_id")
         if source_id is None:
             raise ValueError("Missing required parameter: source_id")
 
-        # Validate source_id
+        # Validate source_id type
         try:
             source_id = int(source_id)
         except (ValueError, TypeError) as e:
             raise ValueError(f"Invalid source_id value: {source_id}") from e
 
-        logger.info(
-            "ADD_STREAM command executing",
-            extra={
-                "event": "add_stream_command_start",
-                "source_id": source_id,
-                "current_stream_count": len(self.config.stream_uris)
-            }
+        # Execute using template method
+        return self._execute_stream_change(
+            source_id=source_id,
+            operation=self.config.add_stream,
+            command_name="ADD_STREAM"
         )
-
-        # Publish intermediate status
-        if self.control_plane:
-            self.control_plane.publish_status("reconfiguring")
-
-        # Backup for rollback
-        old_stream_uris = list(self.config.stream_uris)
-        old_source_id_mapping = list(self.config.source_id_mapping) if self.config.source_id_mapping else []
-
-        # Set restart flag BEFORE calling restart (for join() detection)
-        if self.processor:
-            self.processor._is_restarting = True
-
-        try:
-            # Use config's add_stream method (validates + constructs URI)
-            self.config.add_stream(source_id)
-            stream_uri = self.config.stream_uris[-1]
-
-            logger.info(
-                "Stream config updated, restarting pipeline",
-                extra={
-                    "event": "add_stream_config_updated",
-                    "new_stream_count": len(self.config.stream_uris),
-                    "added_stream_uri": stream_uri
-                }
-            )
-
-            # Restart pipeline with updated config
-            self.pipeline.restart_pipeline()
-
-            logger.info(
-                "ADD_STREAM completed successfully",
-                extra={
-                    "event": "add_stream_completed",
-                    "source_id": source_id,
-                    "new_stream_count": len(self.config.stream_uris)
-                }
-            )
-
-        except (ConfigValidationError, Exception) as e:
-            # Rollback to backup
-            self.config.stream_uris = old_stream_uris
-            self.config.source_id_mapping = old_source_id_mapping
-
-            logger.error(
-                "ADD_STREAM failed, rolled back",
-                extra={
-                    "event": "add_stream_failed",
-                    "error_type": type(e).__name__,
-                    "error_message": str(e)
-                },
-                exc_info=True
-            )
-
-            if self.control_plane:
-                self.control_plane.publish_status("error")
-
-            raise
-        finally:
-            # Clear restart flag
-            if self.processor:
-                self.processor._is_restarting = False
 
     def handle_remove_stream(self, params: dict):
         """
@@ -365,84 +302,23 @@ class CommandHandlers:
         Params:
             source_id (int): Source ID to remove (e.g., 2)
         """
+        # Validate parameter presence
         source_id = params.get("source_id")
         if source_id is None:
             raise ValueError("Missing required parameter: source_id")
 
-        # Validate source_id
+        # Validate source_id type
         try:
             source_id = int(source_id)
         except (ValueError, TypeError) as e:
             raise ValueError(f"Invalid source_id value: {source_id}") from e
 
-        logger.info(
-            "REMOVE_STREAM command executing",
-            extra={
-                "event": "remove_stream_command_start",
-                "source_id": source_id,
-                "current_stream_count": len(self.config.stream_uris)
-            }
+        # Execute using template method
+        return self._execute_stream_change(
+            source_id=source_id,
+            operation=self.config.remove_stream,
+            command_name="REMOVE_STREAM"
         )
-
-        # Publish intermediate status
-        if self.control_plane:
-            self.control_plane.publish_status("reconfiguring")
-
-        # Backup for rollback
-        old_stream_uris = list(self.config.stream_uris)
-        old_source_id_mapping = list(self.config.source_id_mapping) if self.config.source_id_mapping else []
-
-        # Set restart flag BEFORE calling restart (for join() detection)
-        if self.processor:
-            self.processor._is_restarting = True
-
-        try:
-            # Use config's remove_stream method (validates + removes)
-            self.config.remove_stream(source_id)
-
-            logger.info(
-                "Stream config updated, restarting pipeline",
-                extra={
-                    "event": "remove_stream_config_updated",
-                    "new_stream_count": len(self.config.stream_uris)
-                }
-            )
-
-            # Restart pipeline
-            self.pipeline.restart_pipeline()
-
-            logger.info(
-                "REMOVE_STREAM completed successfully",
-                extra={
-                    "event": "remove_stream_completed",
-                    "source_id": source_id,
-                    "new_stream_count": len(self.config.stream_uris)
-                }
-            )
-
-        except (ConfigValidationError, Exception) as e:
-            # Rollback to backup
-            self.config.stream_uris = old_stream_uris
-            self.config.source_id_mapping = old_source_id_mapping
-
-            logger.error(
-                "REMOVE_STREAM failed, rolled back",
-                extra={
-                    "event": "remove_stream_failed",
-                    "error_type": type(e).__name__,
-                    "error_message": str(e)
-                },
-                exc_info=True
-            )
-
-            if self.control_plane:
-                self.control_plane.publish_status("error")
-
-            raise
-        finally:
-            # Clear restart flag
-            if self.processor:
-                self.processor._is_restarting = False
 
     # ========================================================================
     # Observability Commands
@@ -701,6 +577,96 @@ class CommandHandlers:
                 },
                 exc_info=True
             )
+            raise
+        finally:
+            # Clear restart flag
+            if self.processor:
+                self.processor._is_restarting = False
+
+    def _execute_stream_change(
+        self,
+        source_id: int,
+        operation: Callable[[int], None],
+        command_name: str
+    ) -> None:
+        """
+        Template method for stream change commands (add/remove).
+
+        Pattern: Validate → Backup → Execute → Rollback on error
+
+        This eliminates duplication between handle_add_stream and handle_remove_stream.
+
+        Args:
+            source_id: Stream source ID to add or remove
+            operation: Config method to call (config.add_stream or config.remove_stream)
+            command_name: Command name for logging (e.g., "ADD_STREAM", "REMOVE_STREAM")
+
+        Raises:
+            ConfigValidationError: If validation or operation fails (after rollback)
+        """
+        logger.info(
+            f"{command_name} executing",
+            extra={
+                "event": f"{command_name.lower()}_command_start",
+                "source_id": source_id,
+                "current_stream_count": len(self.config.stream_uris)
+            }
+        )
+
+        # Publish intermediate status
+        if self.control_plane:
+            self.control_plane.publish_status("reconfiguring")
+
+        # Backup for rollback (defensive copy)
+        old_stream_uris = list(self.config.stream_uris)
+        old_source_id_mapping = list(self.config.source_id_mapping) if self.config.source_id_mapping else []
+
+        # Set restart flag BEFORE calling restart (for join() detection)
+        if self.processor:
+            self.processor._is_restarting = True
+
+        try:
+            # Execute operation (config.add_stream(source_id) or config.remove_stream(source_id))
+            operation(source_id)
+
+            logger.info(
+                f"Stream config updated, restarting pipeline",
+                extra={
+                    "event": f"{command_name.lower()}_config_updated",
+                    "new_stream_count": len(self.config.stream_uris)
+                }
+            )
+
+            # Restart pipeline with updated config
+            self.pipeline.restart_pipeline()
+
+            logger.info(
+                f"✅ {command_name} completed successfully",
+                extra={
+                    "event": f"{command_name.lower()}_completed",
+                    "source_id": source_id,
+                    "new_stream_count": len(self.config.stream_uris)
+                }
+            )
+
+        except (ConfigValidationError, Exception) as e:
+            # Rollback to backup
+            self.config.stream_uris = old_stream_uris
+            self.config.source_id_mapping = old_source_id_mapping
+
+            logger.error(
+                f"❌ {command_name} failed, rolled back",
+                extra={
+                    "event": f"{command_name.lower()}_failed",
+                    "error_type": type(e).__name__,
+                    "error_message": str(e)
+                },
+                exc_info=True
+            )
+
+            if self.control_plane:
+                self.control_plane.publish_status("error")
+
             raise
         finally:
             # Clear restart flag
