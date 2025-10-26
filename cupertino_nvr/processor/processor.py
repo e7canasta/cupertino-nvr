@@ -13,9 +13,10 @@ from typing import Optional
 
 import paho.mqtt.client as mqtt
 
-from cupertino_nvr.processor.config import StreamProcessorConfig
+from cupertino_nvr.processor.config import StreamProcessorConfig, ConfigValidationError
 from cupertino_nvr.processor.mqtt_sink import MQTTDetectionSink
 from cupertino_nvr.processor.control_plane import MQTTControlPlane
+from cupertino_nvr.processor.metrics_reporter import MetricsReporter
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,8 @@ class StreamProcessor:
         self.mqtt_sink: Optional[object] = None
         self.watchdog: Optional[object] = None
         self.control_plane: Optional[MQTTControlPlane] = None
-        
+        self.metrics_reporter: Optional[MetricsReporter] = None
+
         # State tracking
         self.is_running = False
         self.is_paused = False
@@ -197,13 +199,7 @@ class StreamProcessor:
                 self.control_plane.publish_status(
                     "starting",
                     uptime_seconds=0,
-                    config={
-                        "stream_uris": self.config.stream_uris,
-                        "source_id_mapping": self.config.source_id_mapping,
-                        "model_id": self.config.model_id,
-                        "max_fps": self.config.max_fps,
-                        "stream_server": self.config.stream_server,
-                    }
+                    config=self.config.to_status_dict()
                 )
                 
                 logger.info(
@@ -230,7 +226,12 @@ class StreamProcessor:
         # Start metrics reporting BEFORE pipeline (pipeline.start() blocks!)
         # =====================================================================
         if self.watchdog and self.config.metrics_reporting_interval > 0:
-            self._start_metrics_reporting_thread()
+            self.metrics_reporter = MetricsReporter(
+                watchdog=self.watchdog,
+                mqtt_client=self.mqtt_client,
+                config=self.config
+            )
+            self.metrics_reporter.start()
 
         # =====================================================================
         # PRODUCTION MODE: Pipeline starting
@@ -400,6 +401,9 @@ class StreamProcessor:
 
         if self.control_plane:
             self.control_plane.disconnect()
+
+        if self.metrics_reporter:
+            self.metrics_reporter.stop()
 
         logger.info(
             "StreamProcessor stopped",
@@ -643,9 +647,9 @@ class StreamProcessor:
             }
         )
 
-        if not self.watchdog:
+        if not self.metrics_reporter or not self.watchdog:
             logger.warning(
-                "⚠️ Watchdog not enabled",
+                "⚠️ Metrics reporting not available",
                 extra={
                     "component": "processor",
                     "event": "metrics_unavailable"
@@ -653,13 +657,14 @@ class StreamProcessor:
             )
             return
 
-        # Get full report and publish
-        metrics = self._get_full_metrics_report()
-        self._publish_metrics(
-            topic=f"{self.config.control_status_topic}/metrics",
-            payload=metrics,
-            retained=False  # One-time response
-        )
+        # Get full report from MetricsReporter
+        metrics = self.metrics_reporter.get_full_report()
+
+        # Publish to MQTT
+        import json
+        topic = f"{self.config.control_status_topic}/metrics/{self.config.instance_id}"
+        payload = json.dumps(metrics)
+        self.mqtt_client.publish(topic, payload, qos=0, retain=False)
 
         logger.info(
             "✅ METRICS report published",
@@ -698,14 +703,7 @@ class StreamProcessor:
             self.control_plane.publish_status(
                 status=self._get_current_status(),
                 uptime_seconds=uptime_seconds,
-                config={
-                    "stream_uris": self.config.stream_uris,
-                    "source_id_mapping": self.config.source_id_mapping,
-                    "model_id": self.config.model_id,
-                    "max_fps": self.config.max_fps,
-                    "stream_server": self.config.stream_server,
-                    "mqtt_topic_prefix": self.config.mqtt_topic_prefix,
-                },
+                config=self.config.to_status_dict(),
                 health={
                     "is_paused": self.is_paused,
                     "pipeline_running": self.is_running and self.pipeline is not None,
@@ -902,7 +900,18 @@ class StreamProcessor:
 
             # Step 4: Restart metrics reporting if enabled
             if self.watchdog and self.config.metrics_reporting_interval > 0:
-                self._start_metrics_reporting_thread()
+                # Stop old reporter if exists
+                if self.metrics_reporter:
+                    self.metrics_reporter.stop()
+
+                # Create and start new reporter with new watchdog
+                self.metrics_reporter = MetricsReporter(
+                    watchdog=self.watchdog,
+                    mqtt_client=self.mqtt_client,
+                    config=self.config
+                )
+                self.metrics_reporter.start()
+
                 logger.debug(
                     "Metrics reporting thread restarted",
                     extra={
@@ -1158,22 +1167,12 @@ class StreamProcessor:
         except (ValueError, TypeError) as e:
             raise ValueError(f"Invalid source_id value: {source_id}") from e
 
-        # Check if already exists
-        if source_id in self.config.source_id_mapping:
-            raise ValueError(f"Stream with source_id {source_id} already exists")
-
-        # Construct stream URI from stream_server + source_id
-        # go2rtc proxy pattern: rtsp://go2rtc-server/{source_id}
-        stream_uri = f"{self.config.stream_server}/{source_id}"
-
         logger.info(
             "ADD_STREAM command executing",
             extra={
                 "component": "processor",
                 "event": "add_stream_command_start",
                 "source_id": source_id,
-                "stream_uri": stream_uri,
-                "stream_server": self.config.stream_server,
                 "current_stream_count": len(self.config.stream_uris)
             }
         )
@@ -1181,10 +1180,15 @@ class StreamProcessor:
         if self.control_plane:
             self.control_plane.publish_status("reconfiguring")
 
+        # Backup for rollback
+        old_stream_uris = list(self.config.stream_uris)
+        old_source_id_mapping = list(self.config.source_id_mapping) if self.config.source_id_mapping else []
+
         try:
-            # Update config
-            self.config.stream_uris.append(stream_uri)
-            self.config.source_id_mapping.append(source_id)
+            # Use config's add_stream method (validates + constructs URI)
+            self.config.add_stream(source_id)
+
+            stream_uri = self.config.stream_uris[-1]  # Just added
 
             logger.info(
                 "Stream config updated, restarting pipeline",
@@ -1210,12 +1214,10 @@ class StreamProcessor:
                 }
             )
 
-        except Exception as e:
-            # Rollback
-            if stream_uri in self.config.stream_uris:
-                idx = self.config.stream_uris.index(stream_uri)
-                self.config.stream_uris.pop(idx)
-                self.config.source_id_mapping.pop(idx)
+        except (ConfigValidationError, Exception) as e:
+            # Rollback to backup
+            self.config.stream_uris = old_stream_uris
+            self.config.source_id_mapping = old_source_id_mapping
 
             logger.error(
                 "ADD_STREAM failed, rolled back",
@@ -1253,10 +1255,6 @@ class StreamProcessor:
         except (ValueError, TypeError) as e:
             raise ValueError(f"Invalid source_id value: {source_id}") from e
 
-        # Check if exists
-        if source_id not in self.config.source_id_mapping:
-            raise ValueError(f"Stream with source_id {source_id} not found")
-
         logger.info(
             "REMOVE_STREAM command executing",
             extra={
@@ -1271,14 +1269,12 @@ class StreamProcessor:
             self.control_plane.publish_status("reconfiguring")
 
         # Backup for rollback
-        idx = self.config.source_id_mapping.index(source_id)
-        removed_uri = self.config.stream_uris[idx]
-        removed_id = self.config.source_id_mapping[idx]
+        old_stream_uris = list(self.config.stream_uris)
+        old_source_id_mapping = list(self.config.source_id_mapping) if self.config.source_id_mapping else []
 
         try:
-            # Update config
-            self.config.stream_uris.pop(idx)
-            self.config.source_id_mapping.pop(idx)
+            # Use config's remove_stream method (validates + removes)
+            self.config.remove_stream(source_id)
 
             logger.info(
                 "Stream config updated, restarting pipeline",
@@ -1302,10 +1298,10 @@ class StreamProcessor:
                 }
             )
 
-        except Exception as e:
-            # Rollback
-            self.config.stream_uris.insert(idx, removed_uri)
-            self.config.source_id_mapping.insert(idx, removed_id)
+        except (ConfigValidationError, Exception) as e:
+            # Rollback to backup
+            self.config.stream_uris = old_stream_uris
+            self.config.source_id_mapping = old_source_id_mapping
 
             logger.error(
                 "REMOVE_STREAM failed, rolled back",
@@ -1347,167 +1343,6 @@ class StreamProcessor:
         client.loop_start()
 
         return client
-
-    def _get_full_metrics_report(self) -> dict:
-        """
-        Get full detailed metrics report (for METRICS command).
-
-        Returns complete watchdog report with all details.
-        """
-        if not self.watchdog:
-            return {}
-
-        from datetime import datetime
-        report = self.watchdog.get_report()
-
-        return {
-            "timestamp": datetime.now().isoformat(),
-            "inference_throughput": report.inference_throughput,
-            "latency_reports": [
-                {
-                    "source_id": r.source_id,
-                    "frame_decoding_latency_ms": round(r.frame_decoding_latency * 1000, 2) if r.frame_decoding_latency else None,
-                    "inference_latency_ms": round(r.inference_latency * 1000, 2) if r.inference_latency else None,
-                    "e2e_latency_ms": round(r.e2e_latency * 1000, 2) if r.e2e_latency else None,
-                }
-                for r in report.latency_reports
-            ],
-            "sources_metadata": [
-                {
-                    "source_id": m.source_id,
-                    "fps": m.fps,
-                    "resolution": f"{m.width}x{m.height}" if m.width and m.height else None,
-                }
-                for m in report.sources_metadata
-            ],
-            "status_updates": [
-                {
-                    "source_id": u.source_id,
-                    "severity": u.severity.name,
-                    "message": u.payload.get("message", "") if isinstance(u.payload, dict) else str(u.payload),
-                }
-                for u in report.video_source_status_updates
-            ]
-        }
-
-    def _get_lightweight_metrics(self) -> dict:
-        """
-        Get lightweight metrics (for periodic reporting).
-
-        Returns only throughput and average latencies.
-        """
-        if not self.watchdog:
-            return {}
-
-        from datetime import datetime
-        report = self.watchdog.get_report()
-
-        # Compute average latency across all sources
-        latencies = [r.e2e_latency for r in report.latency_reports if r.e2e_latency is not None]
-        avg_latency_ms = round(sum(latencies) / len(latencies) * 1000, 2) if latencies else None
-
-        return {
-            "timestamp": datetime.now().isoformat(),
-            "inference_throughput": round(report.inference_throughput, 2),
-            "avg_latency_ms": avg_latency_ms,
-            "sources": [
-                {
-                    "source_id": r.source_id,
-                    "latency_ms": round(r.e2e_latency * 1000, 2) if r.e2e_latency else None,
-                }
-                for r in report.latency_reports
-            ]
-        }
-
-    def _publish_metrics(self, topic: str, payload: dict, retained: bool = False):
-        """Publish metrics to MQTT with instance_id"""
-        import json
-        from datetime import datetime
-
-        if not self.mqtt_client:
-            return
-
-        # Enrich payload with instance_id and timestamp
-        enriched_payload = {
-            "instance_id": self.config.instance_id,
-            "timestamp": datetime.now().isoformat(),
-            **payload
-        }
-
-        # Include instance_id in topic path: nvr/status/metrics/{instance_id}
-        full_topic = f"{topic}/{self.config.instance_id}"
-
-        self.mqtt_client.publish(
-            full_topic,
-            json.dumps(enriched_payload),
-            qos=0,
-            retain=retained
-        )
-
-    def _start_metrics_reporting_thread(self):
-        """Start background thread for periodic metrics reporting"""
-        if self.config.metrics_reporting_interval <= 0:
-            logger.info(
-                "Metrics reporting disabled (interval = 0)",
-                extra={"component": "processor", "event": "metrics_reporting_disabled"}
-            )
-            return
-
-        import threading
-        import time
-
-        def report_metrics():
-            """Periodic metrics reporting loop"""
-            # Keep running until watchdog is None (indicates shutdown)
-            while self.watchdog is not None:
-                time.sleep(self.config.metrics_reporting_interval)
-
-                # Check if processor is shutting down
-                if self.watchdog is None:
-                    break
-
-                try:
-                    metrics = self._get_lightweight_metrics()
-
-                    # Only publish if we have valid data (watchdog has collected samples)
-                    if metrics.get("inference_throughput", 0) > 0:
-                        self._publish_metrics(
-                            topic=self.config.metrics_topic,
-                            payload=metrics,
-                            retained=True  # Retain for new subscribers
-                        )
-
-                        logger.debug(
-                            "📊 Periodic metrics published",
-                            extra={
-                                "component": "processor",
-                                "event": "metrics_periodic",
-                                "inference_throughput": metrics.get("inference_throughput"),
-                                "avg_latency_ms": metrics.get("avg_latency_ms")
-                            }
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"Error publishing periodic metrics: {e}",
-                        extra={
-                            "component": "processor",
-                            "event": "metrics_error"
-                        },
-                        exc_info=True
-                    )
-
-        thread = threading.Thread(target=report_metrics, daemon=True, name="MetricsReporter")
-        thread.start()
-
-        logger.info(
-            f"📊 Metrics reporting started (interval: {self.config.metrics_reporting_interval}s)",
-            extra={
-                "component": "processor",
-                "event": "metrics_reporting_started",
-                "interval": self.config.metrics_reporting_interval,
-                "topic": self.config.metrics_topic
-            }
-        )
 
     def _signal_handler(self, signum, frame):
         """Handle termination signals"""

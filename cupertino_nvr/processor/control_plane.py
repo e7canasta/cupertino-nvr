@@ -15,8 +15,6 @@ from typing import Optional, Callable, Dict
 
 import paho.mqtt.client as mqtt
 
-from cupertino_nvr.logging_utils import log_event, log_command, log_mqtt_event, log_error_with_context
-
 logger = logging.getLogger(__name__)
 
 
@@ -145,47 +143,52 @@ class MQTTControlPlane:
     def _on_connect(self, client, userdata, flags, rc):
         """Callback cuando se conecta al broker"""
         if rc == 0:
-            log_event(
-                logger, "info",
+            logger.info(
                 "Control Plane connected to MQTT broker",
-                component="control_plane",
-                event="broker_connected",
-                broker_host=self.broker_host,
-                broker_port=self.broker_port,
-                return_code=rc
+                extra={
+                    "component": "control_plane",
+                    "event": "broker_connected",
+                    "broker_host": self.broker_host,
+                    "broker_port": self.broker_port,
+                    "return_code": rc
+                }
             )
-            
+
             self.client.subscribe(self.command_topic, qos=1)
-            
-            log_mqtt_event(
-                logger,
-                "subscribed",
-                self.command_topic,
-                component="control_plane",
-                qos=1
+
+            logger.info(
+                f"MQTT subscribed: {self.command_topic}",
+                extra={
+                    "component": "control_plane",
+                    "event": "mqtt_subscribed",
+                    "mqtt_topic": self.command_topic,
+                    "qos": 1
+                }
             )
-            
+
             self._connected.set()
             self.publish_status("connected")
         else:
-            log_error_with_context(
-                logger,
+            logger.error(
                 "Failed to connect to MQTT broker",
-                component="control_plane",
-                event="broker_connection_failed",
-                broker_host=self.broker_host,
-                broker_port=self.broker_port,
-                return_code=rc
+                extra={
+                    "component": "control_plane",
+                    "event": "broker_connection_failed",
+                    "broker_host": self.broker_host,
+                    "broker_port": self.broker_port,
+                    "return_code": rc
+                }
             )
     
     def _on_disconnect(self, client, userdata, rc):
         """Callback cuando se desconecta del broker"""
-        log_event(
-            logger, "warning",
+        logger.warning(
             "Control Plane disconnected from MQTT broker",
-            component="control_plane",
-            event="broker_disconnected",
-            return_code=rc
+            extra={
+                "component": "control_plane",
+                "event": "broker_disconnected",
+                "return_code": rc
+            }
         )
         self._connected.clear()
     
@@ -200,83 +203,122 @@ class MQTTControlPlane:
 
             # Filter: check if this instance should process the command
             if not self._should_process_command(target_instances):
-                log_event(
-                    logger, "debug",
+                logger.debug(
                     "Command filtered (not targeted to this instance)",
-                    component="control_plane",
-                    event="command_filtered",
-                    command=command,
-                    target_instances=target_instances,
-                    this_instance=self.instance_id
+                    extra={
+                        "component": "control_plane",
+                        "event": "command_filtered",
+                        "command": command,
+                        "target_instances": target_instances,
+                        "this_instance": self.instance_id
+                    }
                 )
                 return
 
             # Log cuando recibe el comando
-            log_mqtt_event(
-                logger,
-                "received",
-                msg.topic,
-                component="control_plane",
-                command=command,
-                params=params if params else None,
-                target_instances=target_instances,
-                this_instance=self.instance_id,
-                payload=payload
+            logger.info(
+                f"MQTT received: {msg.topic}",
+                extra={
+                    "component": "control_plane",
+                    "event": "mqtt_received",
+                    "mqtt_topic": msg.topic,
+                    "command": command,
+                    "params": params if params else None,
+                    "target_instances": target_instances,
+                    "this_instance": self.instance_id,
+                    "payload": payload
+                }
             )
 
             # ACK inmediato (estándar IoT)
-            log_command(logger, command, "received", component="control_plane")
+            logger.info(
+                f"Command {command} received",
+                extra={
+                    "component": "control_plane",
+                    "event": "command_received",
+                    "command": command,
+                    "command_status": "received"
+                }
+            )
             self._publish_ack(command, "received")
 
             # Ejecutar comando vía registry (con params)
             try:
-                log_command(logger, command, "executing", component="control_plane")
+                logger.info(
+                    f"Command {command} executing",
+                    extra={
+                        "component": "control_plane",
+                        "event": "command_executing",
+                        "command": command,
+                        "command_status": "executing"
+                    }
+                )
                 self.command_registry.execute(command, params)
 
                 # ACK de completado
                 self._publish_ack(command, "completed")
-                log_command(logger, command, "completed", component="control_plane")
+                logger.info(
+                    f"Command {command} completed",
+                    extra={
+                        "component": "control_plane",
+                        "event": "command_completed",
+                        "command": command,
+                        "command_status": "completed"
+                    }
+                )
 
             except CommandNotAvailableError as e:
-                log_error_with_context(
-                    logger,
+                logger.error(
                     f"Command not available: {command}",
-                    component="control_plane",
-                    event="command_not_available",
-                    command=command,
-                    available_commands=sorted(self.command_registry.available_commands)
+                    extra={
+                        "component": "control_plane",
+                        "event": "command_not_available",
+                        "command": command,
+                        "available_commands": sorted(self.command_registry.available_commands),
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)
+                    }
                 )
                 self._publish_ack(command, "error", str(e))
             except ValueError as e:
                 # Parameter validation error
-                log_error_with_context(
-                    logger,
+                logger.error(
                     f"Invalid parameters for command: {command}",
-                    component="control_plane",
-                    event="command_invalid_params",
-                    command=command,
-                    error=e,
-                    params=params
+                    extra={
+                        "component": "control_plane",
+                        "event": "command_invalid_params",
+                        "command": command,
+                        "params": params,
+                        "error_type": type(e).__name__,
+                        "error_message": str(e)
+                    },
+                    exc_info=True
                 )
                 self._publish_ack(command, "error", str(e))
 
         except json.JSONDecodeError as e:
-            log_error_with_context(
-                logger,
+            logger.error(
                 "Failed to decode MQTT JSON payload",
-                component="control_plane",
-                event="json_decode_error",
-                error=e,
-                raw_payload=str(msg.payload)
+                extra={
+                    "component": "control_plane",
+                    "event": "json_decode_error",
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "raw_payload": str(msg.payload)
+                },
+                exc_info=True
             )
         except Exception as e:
-            log_error_with_context(
-                logger,
+            logger.error(
                 "Error processing MQTT message",
-                component="control_plane",
-                event="message_processing_error",
-                error=e,
-                mqtt_topic=msg.topic
+                extra={
+                    "component": "control_plane",
+                    "event": "message_processing_error",
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "mqtt_topic": msg.topic
+                },
+                exc_info=True
             )
     
     def _should_process_command(self, target_instances) -> bool:
@@ -322,15 +364,17 @@ class MQTTControlPlane:
             qos=1,
             retain=False  # ACKs no se retienen
         )
-        
-        log_mqtt_event(
-            logger,
-            "published",
-            ack_topic,
-            component="control_plane",
-            command=command,
-            ack_status=ack_status,
-            ack_message=message if message else None
+
+        logger.info(
+            f"MQTT published: {ack_topic}",
+            extra={
+                "component": "control_plane",
+                "event": "mqtt_published",
+                "mqtt_topic": ack_topic,
+                "command": command,
+                "ack_status": ack_status,
+                "ack_message": message if message else None
+            }
         )
     
     def publish_status(self, status: str, **extra_fields):
@@ -358,55 +402,62 @@ class MQTTControlPlane:
             qos=1,
             retain=True
         )
-        
-        log_mqtt_event(
-            logger,
-            "published",
-            topic,
-            component="control_plane",
-            instance_id=self.instance_id,
-            status=status,
-            retained=True
+
+        logger.info(
+            f"MQTT published: {topic}",
+            extra={
+                "component": "control_plane",
+                "event": "mqtt_published",
+                "mqtt_topic": topic,
+                "instance_id": self.instance_id,
+                "status": status,
+                "retained": True
+            }
         )
     
     def connect(self, timeout: float = 5.0) -> bool:
         """Conecta al broker MQTT"""
         try:
-            log_event(
-                logger, "info",
+            logger.info(
                 "Connecting to MQTT broker",
-                component="control_plane",
-                event="broker_connection_attempt",
-                broker_host=self.broker_host,
-                broker_port=self.broker_port,
-                timeout=timeout
+                extra={
+                    "component": "control_plane",
+                    "event": "broker_connection_attempt",
+                    "broker_host": self.broker_host,
+                    "broker_port": self.broker_port,
+                    "timeout": timeout
+                }
             )
-            
+
             self.client.connect(self.broker_host, self.broker_port, keepalive=60)
             self.client.loop_start()
             return self._connected.wait(timeout=timeout)
-            
+
         except Exception as e:
-            log_error_with_context(
-                logger,
+            logger.error(
                 "Failed to connect to MQTT broker",
-                component="control_plane",
-                event="broker_connection_exception",
-                error=e,
-                broker_host=self.broker_host,
-                broker_port=self.broker_port
+                extra={
+                    "component": "control_plane",
+                    "event": "broker_connection_exception",
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "broker_host": self.broker_host,
+                    "broker_port": self.broker_port
+                },
+                exc_info=True
             )
             return False
     
     def disconnect(self):
         """Desconecta del broker MQTT"""
-        log_event(
-            logger, "info",
+        logger.info(
             "Disconnecting Control Plane",
-            component="control_plane",
-            event="control_plane_disconnect"
+            extra={
+                "component": "control_plane",
+                "event": "control_plane_disconnect"
+            }
         )
-        
+
         self.publish_status("disconnected")
         self.client.loop_stop()
         self.client.disconnect()

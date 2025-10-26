@@ -2,10 +2,14 @@
 Structured Logging Utilities
 =============================
 
-Utilities for structured JSON logging compatible with log aggregation
-systems like Elasticsearch, Loki, etc.
+Simplified structured JSON logging utilities.
 
-Based on Adeline's logging architecture using pythonjsonlogger.
+Refactored per DESIGN_CONSULTANCY_REFACTORING.md (Prioridad 5):
+- Keep: trace_context, setup_structured_logging (useful)
+- Add: ComponentLogger (LoggerAdapter with automatic component field)
+- Remove: log_event, log_command, log_mqtt_event (unnecessary wrappers)
+
+Philosophy: Direct logger.info(msg, extra={...}) is simpler than indirect helpers.
 """
 
 import logging
@@ -14,7 +18,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from contextvars import ContextVar
 from contextlib import contextmanager
-from typing import Any, Dict, Optional
+from typing import Optional
 import uuid
 
 # ============================================================================
@@ -195,101 +199,76 @@ def setup_structured_logging(
 
 
 # ============================================================================
-# Helper Functions (simplificados - solo facilitan el patrón extra={})
+# ComponentLogger (LoggerAdapter for automatic component field)
 # ============================================================================
 
-def log_event(
-    logger: logging.Logger,
-    level: str,
-    message: str,
-    component: str,
-    event: str,
-    **kwargs
-) -> None:
+class ComponentLogger(logging.LoggerAdapter):
     """
-    Helper para logs estructurados con component/event.
-    
+    Logger adapter that automatically adds 'component' and 'trace_id' fields.
+
+    Simplifies structured logging by eliminating the need for helper functions.
+    Just use standard logger.info(msg, extra={...}) and component is added automatically.
+
     Args:
-        logger: Logger instance
-        level: Log level (info, warning, error, etc.)
-        message: Human-readable message
-        component: Component name
-        event: Event type
-        **kwargs: Additional structured fields
-    
-    Example:
-        >>> logger = logging.getLogger(__name__)
-        >>> log_event(logger, "info", "Command received", "control_plane", "command_received", command="pause")
+        logger: Base logger
+        extra: Dict with 'component' field (required)
+
+    Usage:
+        >>> logger = ComponentLogger(logging.getLogger(__name__), {"component": "processor"})
+        >>> logger.info("Pipeline started", extra={"event": "pipeline_started", "model_id": "yolo"})
+        # Output: {"message": "Pipeline started", "component": "processor", "event": "pipeline_started", ...}
+
+    Note:
+        - Component field is merged from adapter's extra dict
+        - Trace ID is automatically added from context if available
+        - User-provided extra fields override adapter defaults
     """
-    extra = {
-        "component": component,
-        "event": event,
-        **kwargs
-    }
-    
-    log_method = getattr(logger, level.lower())
-    log_method(message, extra=extra)
+
+    def process(self, msg, kwargs):
+        """
+        Process log record: merge component + trace_id + user extra.
+
+        Order of precedence (highest to lowest):
+        1. User-provided extra (in kwargs)
+        2. Adapter extra (self.extra - contains component)
+        3. Trace ID from context (if available)
+        """
+        # Start with adapter's extra (contains component)
+        extra = dict(self.extra)
+
+        # Add trace_id if available
+        trace_id = get_trace_id()
+        if trace_id:
+            extra['trace_id'] = trace_id
+
+        # Merge with user-provided extra (user overrides adapter)
+        if 'extra' in kwargs:
+            extra.update(kwargs['extra'])
+
+        kwargs['extra'] = extra
+        return msg, kwargs
 
 
-def log_command(
-    logger: logging.Logger,
-    command: str,
-    status: str,
-    component: str = "control_plane",
-    **kwargs
-) -> None:
-    """Helper para logs de comandos MQTT."""
-    log_event(
-        logger,
-        "info" if status in ["received", "completed"] else "error",
-        f"Command {command} {status}",
-        component=component,
-        event=f"command_{status}",
-        command=command,
-        command_status=status,
-        **kwargs
-    )
+def get_component_logger(name: str, component: str) -> ComponentLogger:
+    """
+    Get logger with component automatically added to all log records.
 
+    Convenience factory for ComponentLogger.
 
-def log_mqtt_event(
-    logger: logging.Logger,
-    event_type: str,
-    topic: str,
-    component: str = "mqtt",
-    **kwargs
-) -> None:
-    """Helper para logs de eventos MQTT."""
-    log_event(
-        logger,
-        "info",
-        f"MQTT {event_type}: {topic}",
-        component=component,
-        event=f"mqtt_{event_type}",
-        mqtt_topic=topic,
-        **kwargs
-    )
+    Args:
+        name: Logger name (usually __name__)
+        component: Component name (e.g., "processor", "control_plane", "mqtt_sink")
 
+    Returns:
+        ComponentLogger instance
 
-def log_error_with_context(
-    logger: logging.Logger,
-    message: str,
-    component: str,
-    event: str,
-    error: Optional[Exception] = None,
-    **kwargs
-) -> None:
-    """Helper para logs de errores con contexto completo."""
-    extra = {
-        "component": component,
-        "event": event,
-        **kwargs
-    }
-    
-    if error:
-        extra["error_type"] = type(error).__name__
-        extra["error_message"] = str(error)
-    
-    logger.error(message, extra=extra, exc_info=error is not None)
+    Usage:
+        >>> logger = get_component_logger(__name__, "processor")
+        >>> logger.info("Event", extra={"event": "test", "foo": "bar"})
+        # Automatically includes component="processor"
+    """
+    base_logger = logging.getLogger(name)
+    return ComponentLogger(base_logger, {"component": component})
 
 
 # ============================================================================
@@ -303,10 +282,8 @@ __all__ = [
     "trace_context",
     "get_trace_id",
     "generate_trace_id",
-    # Helpers
-    "log_event",
-    "log_command",
-    "log_mqtt_event",
-    "log_error_with_context",
+    # ComponentLogger
+    "ComponentLogger",
+    "get_component_logger",
 ]
 

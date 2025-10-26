@@ -4,89 +4,220 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Cupertino NVR** - Distributed Network Video Recorder with AI Inference
+**Cupertino NVR** - Headless Network Video Recorder with AI Inference and MQTT Control Plane
 
-Event-driven NVR system with separated inference and visualization using MQTT pub/sub architecture. Built on Roboflow Inference with YOLOv8 for object detection.
+Event-driven NVR system with separated inference and visualization using MQTT pub/sub architecture. Built on Roboflow InferencePipeline with YOLOv8/YOLOv11 for object detection.
 
-## Architecture
+**Current Focus:** Production-ready control plane with dynamic runtime configuration (change models, add/remove streams, adjust FPS - all without restart).
 
-### Bounded Contexts (Clear Separation of Concerns)
+## Core Architecture
 
-1. **Processor** (`cupertino_nvr/processor/`) - Inference domain
-   - Headless inference pipeline wrapping InferencePipeline
-   - Publishes DetectionEvent to MQTT broker
-   - No GUI overhead, designed for scalability
-
-2. **Wall** (`cupertino_nvr/wall/`) - Visualization domain
-   - Event-driven viewer consuming MQTT events
-   - Multiplexes video streams with detection overlays
-   - Thread-safe DetectionCache with TTL for event storage
-
-3. **Events** (`cupertino_nvr/events/`) - Integration domain
-   - Pydantic schemas for DetectionEvent, Detection, BoundingBox
-   - MQTT topic protocol: `nvr/detections/{source_id}`
-   - Type-safe serialization/deserialization
-
-### Data Flow
+### Three-Plane Design
 
 ```
-RTSP Streams → InferencePipeline → MQTTDetectionSink → MQTT Broker
-    ↓              (YOLOv8)           (on_prediction)       ↓
-VideoSource                                          MQTTListener
-    ↓                                                       ↓
-VideoFrame                                          DetectionCache (TTL)
-    ↓                                                       ↓
-multiplex_videos → DetectionRenderer → cv2.imshow("NVR Video Wall")
-    (grid)         (overlay detections)
+┌─────────────────────────────────────────────────────────┐
+│                    StreamProcessor                      │
+│                                                         │
+│  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │ Data Plane  │  │ Control      │  │ Metrics      │  │
+│  │ (Inference) │  │ Plane (MQTT) │  │ Plane        │  │
+│  └──────┬──────┘  └──────┬───────┘  └──────┬───────┘  │
+│         │                │                  │          │
+│         │ on_prediction  │ on_command       │ watchdog │
+│         ▼                ▼                  ▼          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │ MQTT Sink    │◄─┤ Command      │  │ Periodic     │ │
+│  │ (pauseable)  │  │ Handlers     │  │ Reporter     │ │
+│  └──────────────┘  └──────────────┘  └──────────────┘ │
+└─────────────────────────────────────────────────────────┘
 ```
 
-**Critical architectural pattern**: The processor and wall are completely decoupled via MQTT pub/sub. Processor knows nothing about the wall. Wall subscribes to events by source_id topic pattern.
+**Data Plane:** InferencePipeline → MQTTDetectionSink → MQTT broker
+**Control Plane:** MQTT commands → CommandRegistry → Handlers (pause/resume/restart/change_model/etc)
+**Metrics Plane:** Watchdog → Periodic metrics → MQTT (every 10s by default)
 
-### Key Technical Decisions
+### Critical Architectural Patterns
 
-- **InferencePipeline callback pattern**: MQTTDetectionSink implements `__call__` to be compatible with `on_prediction` callback signature
-- **VideoFrame attributes**: Uses `frame.source_id`, `frame.frame_id`, `frame.frame_timestamp` from Roboflow Inference
-- **MQTT QoS 0**: Fire-and-forget for real-time video (no delivery guarantees, lower latency)
-- **TTL-based cache expiration**: DetectionCache automatically expires old events on `get()` - no background cleanup thread needed
-- **Thread-safe cache**: Uses `threading.Lock` for concurrent access from MQTT listener thread and main render thread
-- **Signal handling**: Graceful shutdown on SIGINT/SIGTERM in both processor and wall
-- **Lazy imports**: InferencePipeline/VideoSource imported only when `start()` called to avoid hard dependency
-- **Global STOP flag**: Used by signal handlers to communicate with multiplex_videos `should_stop` callback
+#### 1. Control Plane Initialization Order (CRITICAL!)
+
+```python
+# ✅ CORRECT ORDER (cupertino_nvr/processor/processor.py:63-255)
+def start(self):
+    # 1. Setup MQTT + Sink
+    self.mqtt_client = self._init_mqtt_client()
+    self.mqtt_sink = MQTTDetectionSink(...)
+
+    # 2. Create pipeline (NOT started yet)
+    self.pipeline = InferencePipeline.init(
+        video_reference=streams,
+        model_id=model_id,
+        on_prediction=self.mqtt_sink,
+    )
+
+    # 3. Initialize Control Plane BEFORE pipeline.start()
+    #    (pipeline.start() blocks 20+ seconds connecting to streams)
+    if enable_control_plane:
+        self.control_plane = MQTTControlPlane(...)
+        self._setup_control_commands()
+        self.control_plane.connect()
+        logger.info("✅ CONTROL PLANE READY")
+
+    # 4. Start pipeline (BLOCKS here!)
+    self.pipeline.start()
+    self.is_running = True
+```
+
+**Why this order matters:**
+- `pipeline.start()` blocks for 20+ seconds connecting to RTSP streams
+- If control plane is initialized AFTER, commands sent during startup are lost
+- Commands must work immediately (even during pipeline connection phase)
+
+See: `docs/nvr/BLUEPRINT_INFERENCE_PIPELINE_CONTROL.md` for complete rationale.
+
+#### 2. Thread-Safe Sink Pause (threading.Event pattern)
+
+```python
+# ✅ CORRECT (cupertino_nvr/processor/mqtt_sink.py:65-92)
+class MQTTDetectionSink:
+    def __init__(self):
+        # Use threading.Event (NOT boolean flag!)
+        self._running = threading.Event()
+        self._running.set()  # Start running
+
+    def __call__(self, predictions, video_frame):
+        # Check pause FIRST (memory barrier guaranteed)
+        if not self._running.is_set():
+            return
+
+        # Publish detections...
+
+    def pause(self):
+        self._running.clear()  # Memory barrier
+
+    def resume(self):
+        self._running.set()  # Memory barrier
+```
+
+**Why threading.Event:**
+- ✅ Built-in memory barriers (CPU cache flush across cores)
+- ✅ Thread-safe without explicit locks
+- ✅ Minimal overhead (~50ns per check)
+- ❌ Boolean flags have memory visibility issues (GIL != memory barriers)
+
+#### 3. Two-Level Pause (Immediate + Graceful)
+
+```python
+# ✅ CORRECT PAUSE ORDER (cupertino_nvr/processor/processor.py:455-511)
+def _handle_pause(self):
+    # Check pipeline exists (NOT is_running flag!)
+    if self.pipeline and not self.is_paused:
+        # Step 1: Pause sink FIRST (immediate stop)
+        self.sink.pause()
+
+        # Step 2: Pause pipeline (gradual - frames in queue still process)
+        self.pipeline.pause_stream()
+
+        self.is_paused = True
+        self.control_plane.publish_status("paused")
+
+# ✅ CORRECT RESUME ORDER (cupertino_nvr/processor/processor.py:513-569)
+def _handle_resume(self):
+    if self.pipeline and self.is_paused:
+        # Step 1: Resume pipeline FIRST (start buffering frames)
+        self.pipeline.resume_stream()
+
+        # Step 2: Resume sink (start publishing)
+        self.sink.resume()
+
+        self.is_paused = False
+        self.control_plane.publish_status("running")
+```
+
+**Pause order:** Sink first (immediate), pipeline second (gradual)
+**Resume order:** Pipeline first (buffer ready), sink second (publish)
+
+**Workaround:** `pipeline.pause_stream()` only stops buffering NEW frames. Frames already in prediction queue continue processing for ~5-10s. Sink-level pause provides immediate stop of publications.
 
 ## Development Commands
 
-### Setup & Installation
+### Setup
 
 ```bash
-# Install in development mode (from nvr directory)
+# Install in development mode
 pip install -e ".[dev]"
 
-# Or using Makefile
-make install-dev
+# Or using uv (faster)
+uv pip install -e ".[dev]"
 ```
 
-### Testing
+### Running Locally
 
 ```bash
-# Run all unit tests
-pytest tests/unit/ -v
+# Start MQTT broker (required for all modes)
+docker run -d --name mosquitto -p 1883:1883 eclipse-mosquitto
 
-# Run specific test file
-pytest tests/unit/test_events.py -v
+# Run processor (headless inference with control plane)
+cupertino-nvr processor \
+    --n 6 \
+    --model yolov8x-640 \
+    --enable-control \
+    --metrics-interval 10
 
-# Run with coverage
-pytest tests/unit/ --cov=cupertino_nvr --cov-report=html
+# Run wall (visualization - subscribes to detection events)
+cupertino-nvr wall --n 6
 
-# Using Makefile
-make test           # All tests
-make test-unit      # Unit tests only
-make coverage       # With coverage report
+# Monitor MQTT events
+mosquitto_sub -h localhost -t "nvr/#" -v | jq
+```
+
+### MQTT Control Commands
+
+All commands use JSON format on topic `nvr/control/commands`:
+
+```bash
+# Basic Control
+mosquitto_pub -t nvr/control/commands -m '{"command": "pause", "target_instances": ["*"]}'
+mosquitto_pub -t nvr/control/commands -m '{"command": "resume", "target_instances": ["*"]}'
+mosquitto_pub -t nvr/control/commands -m '{"command": "stop", "target_instances": ["*"]}'
+mosquitto_pub -t nvr/control/commands -m '{"command": "status", "target_instances": ["*"]}'
+mosquitto_pub -t nvr/control/commands -m '{"command": "metrics", "target_instances": ["*"]}'
+
+# Dynamic Configuration (NO RESTART REQUIRED!)
+mosquitto_pub -t nvr/control/commands -m '{"command": "change_model", "params": {"model_id": "yolov11x-640"}, "target_instances": ["*"]}'
+mosquitto_pub -t nvr/control/commands -m '{"command": "set_fps", "params": {"max_fps": 0.5}, "target_instances": ["*"]}'
+mosquitto_pub -t nvr/control/commands -m '{"command": "add_stream", "params": {"source_id": 8}, "target_instances": ["*"]}'
+mosquitto_pub -t nvr/control/commands -m '{"command": "remove_stream", "params": {"source_id": 2}, "target_instances": ["*"]}'
+
+# Discovery & Orchestration
+mosquitto_pub -t nvr/control/commands -m '{"command": "ping", "target_instances": ["*"]}'
+mosquitto_pub -t nvr/control/commands -m '{"command": "rename_instance", "params": {"new_instance_id": "emergency-room-2"}, "target_instances": ["processor-xyz123"]}'
+```
+
+**Multi-instance targeting:**
+- `"target_instances": ["*"]` → Broadcast to all processors
+- `"target_instances": ["proc-a"]` → Single processor
+- `"target_instances": ["proc-a", "proc-b"]` → Multiple processors
+
+**Command acknowledgments:**
+- ACK "received" published immediately on `nvr/control/status/{instance_id}/ack`
+- ACK "completed" or "error" published after execution
+
+### Testing Control Plane
+
+```bash
+# Manual test scripts (see test_*.sh)
+./test_restart_command.sh      # Test RESTART command
+./test_dynamic_config.sh        # Test model/FPS changes
+./test_metrics.sh               # Test metrics reporting
+
+# Debug logging
+JSON_LOGS=true LOG_LEVEL=DEBUG cupertino-nvr processor --enable-control
 ```
 
 ### Code Quality
 
 ```bash
-# Format code
+# Format (black + isort)
 black cupertino_nvr/ tests/
 isort cupertino_nvr/ tests/
 
@@ -94,250 +225,262 @@ isort cupertino_nvr/ tests/
 flake8 cupertino_nvr/ tests/
 mypy cupertino_nvr/
 
-# Using Makefile
-make format
-make lint
-```
-
-### Running Locally
-
-```bash
-# Start MQTT broker (required)
-docker run -d --name mosquitto -p 1883:1883 eclipse-mosquitto
-# Or: make run-broker
-
-# Run processor (headless inference)
-cupertino-nvr processor --n 6 --model yolov8x-640
-
-# Run wall (viewer)
-cupertino-nvr wall --n 6
-
-# Using Makefile
-make run-processor N=6 MODEL=yolov8x-640
-make run-wall N=6
-```
-
-### Debugging MQTT
-
-```bash
-# Monitor all detection events
-mosquitto_sub -h localhost -t "nvr/detections/#" -v
-
-# Pretty print JSON
-mosquitto_sub -h localhost -t "nvr/detections/#" | jq
-
-# Test connection
-mosquitto_pub -h localhost -t "test" -m "hello"
-```
-
-## Code Structure Guidelines
-
-### Understanding the Callback Pattern
-
-**MQTTDetectionSink** is designed as a callable object to work with InferencePipeline:
-```python
-# InferencePipeline calls: on_prediction(predictions, video_frame)
-# MQTTDetectionSink implements: __call__(predictions, video_frame)
-
-# Signature handles both single and batch predictions:
-# - Single: prediction=dict, video_frame=VideoFrame
-# - Batch: predictions=List[dict], video_frames=List[VideoFrame]
-```
-
-This pattern allows the sink to be passed directly to `InferencePipeline.init(on_prediction=sink)`.
-
-### Adding Event Fields
-
-1. Update `cupertino_nvr/events/schema.py` with new Pydantic field
-2. Update `cupertino_nvr/processor/mqtt_sink.py` in `_create_event()` method
-3. Update `cupertino_nvr/wall/renderer.py` if visualization needed
-4. Add unit test in `tests/unit/test_events.py`
-
-**Example flow**: To add "detection_count" field:
-- Schema: `detection_count: int = Field(...)`
-- MQTTSink: `detection_count=len(prediction.get("predictions", []))`
-- Renderer: Use `event.detection_count` for overlay text
-- Test: Verify serialization round-trip
-
-### Adding Configuration Options
-
-1. Update config dataclass in `processor/config.py` or `wall/config.py`
-2. Add CLI option in `cli.py` if user-facing
-3. Use in implementation (access via `self.config.option_name`)
-
-**Note**: CLI uses `--n` for number of streams and auto-generates URIs like `rtsp://server/live/{i}.stream`.
-
-### Environment Variables
-
-- `STREAM_SERVER`: Default RTSP server URL (fallback: `rtsp://localhost:8554`)
-- Used by CLI when `--stream-server` not provided
-
-### Import Conventions
-
-Use absolute imports (not relative):
-```python
-# ✅ Good
-from cupertino_nvr.events import DetectionEvent
-
-# ❌ Bad
-from .events import DetectionEvent
-```
-
-## Important Design Principles
-
-This codebase follows the **Visiona Design Manifesto** ("Blues Style"):
-
-### Pragmatismo > Purismo
-- Reuse proven components (InferencePipeline, supervision)
-- Simple solutions that work (JSON over MQTT, not MessagePack)
-- MVP functionality first, optimization later
-
-### Bounded Contexts Claros
-- Processor, Wall, and Events are independent modules
-- Each has single responsibility and minimal coupling
-- Processor doesn't know about Wall (pub/sub decoupling)
-
-### KISS ≠ Simplicidad Ingenua
-- Simple architecture, not simplistic
-- DetectionCache has TTL to prevent memory leaks
-- Thread-safe operations with proper locking
-- Graceful error handling throughout
-
-### Diseño Evolutivo
-- Extension points for Phase 2 (event store, web UI)
-- Clean interfaces for future enhancements
-- No premature optimization
-
-## Dependencies
-
-### Core Dependencies
-- `paho-mqtt` - MQTT client for pub/sub messaging
-- `pydantic` - Schema validation and serialization
-- `opencv-python` - Video processing
-- `supervision` - Detection annotations
-- Roboflow Inference (external) - Core inference engine
-
-### Installation Note
-The parent `inference` package must be installed separately (Roboflow Inference framework):
-```bash
-cd ../..  # Go to repo root (inference/)
-pip install -e .
-cd cupertino/nvr
-```
-
-**Why separate**: `cupertino-nvr` is an independent package that uses Roboflow Inference as a library, not part of the inference core. This allows separate versioning and deployment.
-
-## Common Issues & Debugging
-
-### "ModuleNotFoundError: No module named 'inference'"
-Install parent inference package from repo root: `pip install -e .`
-
-### "Connection refused" on MQTT
-Start MQTT broker: `docker run -d -p 1883:1883 eclipse-mosquitto`
-
-Check broker is running: `docker ps | grep mosquitto`
-
-### No detections appearing in VideoWall
-1. Verify processor is publishing: `mosquitto_sub -t "nvr/detections/#" -v`
-2. Check topic pattern matches: Topics should be `nvr/detections/0`, `nvr/detections/1`, etc.
-3. Verify cache TTL not expiring too fast (default 1 second)
-4. Check MQTT connection in wall logs
-
-### Import errors with relative imports
-Use absolute imports: `from cupertino_nvr.events import ...`
-
-### AttributeError on VideoFrame
-Ensure using Roboflow Inference's `VideoFrame` which has `source_id`, `frame_id`, `frame_timestamp` attributes.
-
-## Testing Philosophy
-
-- **Unit tests**: Mock external dependencies (MQTT client, VideoFrame objects)
-- **Integration tests**: Require MQTT broker + RTSP streams + Roboflow Inference installed
-- **Manual test execution**: Tests are reviewed and run manually (pair-programming style, not CI/CD automated)
-- **Test coverage focus**: Serialization round-trips, thread safety (concurrent access), error handling (missing data), TTL expiration logic
-
-### Running Single Tests
-
-```bash
-# Single test file
-pytest tests/unit/test_events.py -v
-
-# Single test function
+# Tests (manual execution - pair programming style)
+pytest tests/unit/ -v
 pytest tests/unit/test_events.py::test_detection_event_serialization -v
-
-# Single test with output
-pytest tests/unit/test_cache.py::test_cache_ttl_expiration -v -s
 ```
 
-## Git Commit Convention
+## Code Structure & Key Files
 
-Commits use:
+### StreamProcessor Architecture
+
+**Core files:**
+- `cupertino_nvr/processor/processor.py` - Main service class (1524 lines)
+  - `start()` - Initialization order (CRITICAL - see line 63-255)
+  - `_handle_pause/resume/stop()` - Basic control (line 455-615)
+  - `_handle_restart()` - Pipeline recreation (line 792-967)
+  - `_handle_change_model/set_fps/add_stream/remove_stream()` - Dynamic config (line 969-1324)
+  - `_handle_ping()` - Discovery pattern (line 673-726)
+
+- `cupertino_nvr/processor/mqtt_sink.py` - Thread-safe detection publisher
+  - Uses `threading.Event` for pause control (line 65-92)
+  - Handles both single and batch predictions (line 94-150)
+
+- `cupertino_nvr/processor/control_plane.py` - MQTT command handling
+  - `CommandRegistry` - Command registration and execution (line 28-91)
+  - `MQTTControlPlane` - MQTT client wrapper (line 93-413)
+  - Instance filtering (`_should_process_command()` - line 282-297)
+
+- `cupertino_nvr/processor/config.py` - Configuration dataclass
+  - `StreamProcessorConfig` with defaults and validation
+  - Instance ID auto-generation (UUID-based)
+
+### Event Protocol
+
+- `cupertino_nvr/events/schema.py` - Pydantic schemas
+  - `DetectionEvent`, `Detection`, `BoundingBox`
+  - JSON serialization/deserialization
+
+- `cupertino_nvr/events/protocol.py` - MQTT topic utilities
+  - `topic_for_source(prefix, source_id)` → `"nvr/detections/0"`
+  - `parse_source_id_from_topic(topic)` → `0`
+
+### Wall (Visualization)
+
+- `cupertino_nvr/wall/wall.py` - Video wall main
+- `cupertino_nvr/wall/renderer.py` - Detection overlay (uses `supervision` annotators)
+- `cupertino_nvr/wall/detection_cache.py` - TTL-based cache (thread-safe)
+- `cupertino_nvr/wall/mqtt_listener.py` - Event subscriber
+
+## Important Implementation Notes
+
+### Dynamic Configuration Pattern
+
+All dynamic config commands (`change_model`, `set_fps`, `add_stream`, `remove_stream`) follow this pattern:
+
+```python
+def _handle_change_model(self, params: dict):
+    # 1. Validate params
+    new_model_id = params.get('model_id')
+    if not new_model_id:
+        raise ValueError("Missing required parameter: model_id")
+
+    # 2. Backup for rollback
+    old_model_id = self.config.model_id
+
+    # 3. Publish intermediate status
+    self.control_plane.publish_status("reconfiguring")
+
+    try:
+        # 4. Update config
+        self.config.model_id = new_model_id
+
+        # 5. Restart pipeline with new config
+        self._handle_restart()  # Terminates old, creates new, starts
+
+        # 6. Status published by restart handler ("running" or "error")
+
+    except Exception as e:
+        # 7. Rollback on failure
+        self.config.model_id = old_model_id
+        self.control_plane.publish_status("error")
+        raise
+```
+
+**Key insight:** Config changes trigger `_handle_restart()` which:
+1. Terminates current pipeline
+2. Sets `_is_restarting = True` flag
+3. Recreates pipeline with updated config
+4. Restarts pipeline
+5. `join()` detects restart and rejoins new pipeline (line 280-387)
+
+### go2rtc Proxy Pattern
+
+Stream URIs follow go2rtc convention:
+```python
+# CLI: --stream-server rtsp://go2rtc-server
+# Auto-generates: rtsp://go2rtc-server/0, rtsp://go2rtc-server/1, ...
+
+# ADD_STREAM command:
+# source_id=8 → rtsp://go2rtc-server/8
+stream_uri = f"{self.config.stream_server}/{source_id}"
+```
+
+This allows dynamic stream addition without pre-configuring URIs.
+
+See: `docs/nvr/GO2RTC_PROXY_ARCHITECTURE.md`
+
+### Structured Logging
+
+Uses `python-json-logger` for machine-readable logs:
+
+```python
+from cupertino_nvr.logging_utils import log_event, log_command, log_mqtt_event
+
+log_event(logger, "info", "Pipeline started",
+    component="processor", event="pipeline_started", model_id=model_id)
+
+log_command(logger, "pause", "received", component="control_plane")
+
+log_mqtt_event(logger, "published", topic, component="control_plane", status="paused")
+```
+
+**Environment variables:**
+- `JSON_LOGS=true` - Enable JSON format (default: human-readable)
+- `LOG_LEVEL=DEBUG` - Set log level (default: INFO)
+
+### Metrics & Watchdog
+
+```python
+# Enable watchdog in config
+config.enable_watchdog = True  # Default: True
+config.metrics_reporting_interval = 10  # Seconds (0 = disabled)
+
+# Watchdog provides:
+# - inference_throughput (inferences/second)
+# - latency_reports (per-source e2e/decoding/inference latency)
+# - sources_metadata (FPS, resolution)
+# - status_updates (warnings, errors)
+
+# Metrics published to: nvr/status/metrics/{instance_id}
+# Full report on-demand: {"command": "metrics"}
+```
+
+## Common Pitfalls & Solutions
+
+### ❌ 1. Control Plane After pipeline.start()
+
+```python
+# WRONG
+self.pipeline.start()  # Blocks 20+ seconds
+self.control_plane = MQTTControlPlane(...)  # Too late!
+```
+
+**Fix:** Initialize control plane BEFORE `pipeline.start()` (see line 157 in processor.py)
+
+### ❌ 2. Checking is_running in Handlers
+
+```python
+# WRONG
+if self.is_running:  # False during startup!
+    self.pipeline.pause()
+```
+
+**Fix:** Check `if self.pipeline:` (object exists, not state flag)
+
+### ❌ 3. Boolean Flag for Pause
+
+```python
+# WRONG - Memory visibility issue
+self._paused = False
+if self._paused:  # May read stale value from CPU cache
+    return
+```
+
+**Fix:** Use `threading.Event` (built-in memory barriers)
+
+### ❌ 4. Heavy Model Initialization
+
+```python
+# WRONG - InferencePipeline may try to download SAM2/CLIP/etc
+from inference import InferencePipeline  # Import at module level
+```
+
+**Fix:** Disable heavy models BEFORE import (see cli.py:16-25)
+```python
+# Set env vars BEFORE importing inference
+os.environ["CORE_MODEL_SAM2_ENABLED"] = "False"
+os.environ["CORE_MODEL_CLIP_ENABLED"] = "False"
+# ... then import
+```
+
+## Git Workflow
+
+### Commit Convention
+
 ```
 Co-Authored-By: Gaby <noreply@visiona.com>
 ```
 
-NOT "Generated with Claude Code" - the Co-Authored-By makes it clear.
+**NOT** "Generated with Claude Code" (the Co-Authored-By makes it clear).
+
+### Testing Philosophy
+
+- Tests are executed manually (pair-programming style, not CI/CD automated)
+- Focus on: serialization round-trips, thread safety, TTL expiration, error handling
+- Mock external dependencies (MQTT client, VideoFrame objects)
+- Integration tests require: MQTT broker + RTSP streams + Roboflow Inference installed
 
 ## Documentation References
 
-- **[README.md](README.md)** - User-facing documentation and quick start
-- **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)** - Detailed developer reference
-- **[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)** - Current implementation status
-- **[../../wiki/DESIGN_NVR_MULTIPLEXER.md](../../wiki/DESIGN_NVR_MULTIPLEXER.md)** - Complete architecture design
-- **[../../wiki/MANIFESTO_DISENO - Blues Style.md](../../wiki/MANIFESTO_DISENO%20-%20Blues%20Style.md)** - Design philosophy
+**Project docs:**
+- `docs/nvr/BLUEPRINT_INFERENCE_PIPELINE_CONTROL.md` - Complete control plane guide
+- `docs/nvr/QUICK_REFERENCE_CONTROL_PLANE.md` - Quick reference for common patterns
+- `docs/nvr/GO2RTC_PROXY_ARCHITECTURE.md` - Stream proxy pattern
+- `docs/nvr/DISCOVERY_HEARTBEAT_PATTERN.md` - PING/PONG orchestration
+- `docs/nvr/IOT_COMMAND_PATTERN.md` - Command ACK protocol
+- `docs/nvr/WATCHDOG_EXPLAINED.md` - Metrics collection
 
-## Performance Targets
+**Reference docs (Roboflow):**
+- `docs/references/adeline/` - Reference architecture (similar control plane)
+- `docs/references/roboflow/inference/` - InferencePipeline docs
+- `docs/references/roboflow/supervision/` - Detection annotation library
 
-- End-to-end latency: <200ms (RTSP → display)
+## Performance & Deployment
+
+**Targets:**
+- End-to-end latency: <200ms (RTSP → MQTT publish)
 - CPU usage: 55-65% for 12 streams (6-core Intel i5-10400)
 - Memory (Processor): ~2.5GB
 - Memory (Wall): ~800MB
-- Scalability: N processors + M viewers (horizontal scaling)
+- Scalability: N processors + M viewers (horizontal scaling via MQTT)
+
+**Production considerations:**
+- Use `--json-logs` for log aggregation (Elasticsearch, Loki)
+- Set `--metrics-interval 60` for production (lower overhead)
+- Use `--instance-id` for meaningful names (e.g., "emergency-room-1")
+- Monitor MQTT ACK topics for command failures
+- Use retained messages for status (new subscribers get last state)
 
 ## Current Status
 
 **Version:** 0.1.0
-**Status:** MVP Phase 1 Complete
-**Next:** Integration testing and deployment
+**Status:** MVP Phase 1 Complete + Control Plane Production-Ready
 
-### Completed
+**Completed:**
 ✅ Event protocol with Pydantic schemas
 ✅ StreamProcessor with MQTT publishing
 ✅ VideoWall with MQTT consumption
 ✅ CLI commands
-✅ Unit tests >80% coverage
+✅ MQTT Control Plane (pause/resume/stop/status/metrics)
+✅ Dynamic Configuration (change_model/set_fps/add_stream/remove_stream)
+✅ Discovery Pattern (PING/PONG)
+✅ Multi-instance orchestration
+✅ Structured JSON logging
+✅ Metrics reporting (watchdog integration)
 
-### Pending
-🟡 Integration tests (requires hardware setup)
-🟡 Long-running stability tests (1+ hours)
+**Next:**
+🟡 Long-running stability tests (24+ hours)
 🟡 Performance validation on target hardware
-
-## Implementation Notes
-
-### MQTT Topic Hierarchy
-- Pattern: `{prefix}/{source_id}` (e.g., `nvr/detections/0`)
-- Prefix configurable via `StreamProcessorConfig.mqtt_topic_prefix`
-- Wall subscribes to wildcard: `nvr/detections/#` to receive all sources
-- Protocol utilities in `events/protocol.py`: `topic_for_source()`, `parse_source_id_from_topic()`
-
-### DetectionCache TTL Mechanism
-- **On write**: Stores `(event, timestamp)` tuple
-- **On read**: Checks `datetime.now() - timestamp > ttl` and auto-deletes if expired
-- **No background thread**: Expiration happens lazily during `get()` calls
-- **Thread-safe**: All operations protected by `threading.Lock`
-
-This design prevents memory leaks without requiring a cleanup thread - expired entries are removed when accessed.
-
-### VideoWall Rendering Pipeline
-1. `multiplex_videos()` yields `List[VideoFrame]` batches (one frame per camera)
-2. For each frame, look up cached detections by `frame.source_id`
-3. `DetectionRenderer.render_frame()` draws bboxes and labels using supervision annotators
-4. Frames arranged in grid (configurable columns)
-5. Grid displayed via `cv2.imshow()`
-
-**Key insight**: Wall doesn't do inference. It only renders frames + overlays from MQTT events.
-
-**Recent refactor (2025-10-25)**: DetectionRenderer migrated from raw OpenCV to supervision annotators (`BoxAnnotator`, `LabelAnnotator`). This provides:
-- Better visual quality (optimized drawing)
-- Less code (~68% reduction in `_draw_detections`)
-- Extensibility for keypoints/segmentation (see `docs/wiki/QUICKWIN_SUPERVISION_INTEGRATION.md`)
+🟡 Event store integration (PostgreSQL/TimescaleDB)
+🟡 Web UI for orchestration
