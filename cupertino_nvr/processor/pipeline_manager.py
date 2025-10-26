@@ -294,6 +294,45 @@ class InferencePipelineManager:
             extra={"event": "restart_completed"}
         )
 
+    def restart_with_coordination(
+        self,
+        new_config: Optional[dict] = None,
+        coordinator: Optional[Any] = None
+    ) -> None:
+        """
+        Restart pipeline with coordination flag management.
+
+        Centralizes restart logic + flag setting for join() detection.
+        The coordinator (StreamProcessor) sets _is_restarting flag to signal
+        join() that this is a restart, not a shutdown.
+
+        Args:
+            new_config: Optional dict of config updates to apply before restart
+            coordinator: Optional StreamProcessor reference (for _is_restarting flag)
+
+        Example:
+            >>> # CommandHandlers calls this instead of restart_pipeline()
+            >>> self.pipeline.restart_with_coordination(
+            ...     new_config={"model_id": "yolov11x-640"},
+            ...     coordinator=self.processor
+            ... )
+
+        Note:
+            This method is the ONLY place where _is_restarting flag should be managed.
+            Command handlers should call this method instead of restart_pipeline() directly.
+        """
+        # Set coordination flag BEFORE restarting
+        if coordinator:
+            coordinator._is_restarting = True
+
+        try:
+            # Delegate to restart_pipeline (actual restart logic)
+            self.restart_pipeline(new_config=new_config)
+        finally:
+            # Clear coordination flag AFTER restart completes (or fails)
+            if coordinator:
+                coordinator._is_restarting = False
+
     def terminate_pipeline(self):
         """
         Terminate pipeline completely.

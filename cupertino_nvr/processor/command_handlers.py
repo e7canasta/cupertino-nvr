@@ -194,7 +194,7 @@ class CommandHandlers:
         IoT Pattern:
         1. ACK "received" (automatic - done by control_plane)
         2. Publish status "restarting"
-        3. Execute restart
+        3. Execute restart (with coordination)
         4. Publish status "running" or "error"
         5. ACK "completed" or "error" (automatic - done by control_plane)
         """
@@ -207,12 +207,10 @@ class CommandHandlers:
         if self.control_plane:
             self.control_plane.publish_status("restarting")
 
-        # Set restart flag BEFORE calling restart (for join() detection)
-        if self.processor:
-            self.processor._is_restarting = True
-
         try:
-            self.pipeline.restart_pipeline()
+            # Use restart_with_coordination (handles flag internally)
+            self.pipeline.restart_with_coordination(coordinator=self.processor)
+
             self.control_plane.publish_status("running")
             logger.info("✅ RESTART completed", extra={"event": "restart_completed"})
         except Exception as e:
@@ -227,10 +225,6 @@ class CommandHandlers:
             )
             self.control_plane.publish_status("error")
             raise
-        finally:
-            # Clear restart flag
-            if self.processor:
-                self.processor._is_restarting = False
 
     # ========================================================================
     # Dynamic Configuration Commands (with Template Method)
@@ -536,10 +530,6 @@ class CommandHandlers:
         if self.control_plane:
             self.control_plane.publish_status("reconfiguring")
 
-        # Set restart flag BEFORE calling restart (for join() detection)
-        if self.processor:
-            self.processor._is_restarting = True
-
         try:
             # 4. Update config
             setattr(self.config, config_attr, validated_value)
@@ -552,8 +542,8 @@ class CommandHandlers:
                 }
             )
 
-            # 5. Restart pipeline with new config
-            self.pipeline.restart_pipeline()
+            # 5. Restart pipeline with coordination
+            self.pipeline.restart_with_coordination(coordinator=self.processor)
 
             logger.info(
                 f"✅ {command_name} completed",
@@ -578,10 +568,6 @@ class CommandHandlers:
                 exc_info=True
             )
             raise
-        finally:
-            # Clear restart flag
-            if self.processor:
-                self.processor._is_restarting = False
 
     def _execute_stream_change(
         self,
@@ -621,10 +607,6 @@ class CommandHandlers:
         old_stream_uris = list(self.config.stream_uris)
         old_source_id_mapping = list(self.config.source_id_mapping) if self.config.source_id_mapping else []
 
-        # Set restart flag BEFORE calling restart (for join() detection)
-        if self.processor:
-            self.processor._is_restarting = True
-
         try:
             # Execute operation (config.add_stream(source_id) or config.remove_stream(source_id))
             operation(source_id)
@@ -637,8 +619,8 @@ class CommandHandlers:
                 }
             )
 
-            # Restart pipeline with updated config
-            self.pipeline.restart_pipeline()
+            # Restart pipeline with coordination
+            self.pipeline.restart_with_coordination(coordinator=self.processor)
 
             logger.info(
                 f"✅ {command_name} completed successfully",
@@ -668,10 +650,6 @@ class CommandHandlers:
                 self.control_plane.publish_status("error")
 
             raise
-        finally:
-            # Clear restart flag
-            if self.processor:
-                self.processor._is_restarting = False
 
     # ========================================================================
     # Private: Validators
